@@ -1,0 +1,29 @@
+name: Build
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Release Drafter"]
+    types: [completed]
+
+# The called workflow's draft-release jobs (read draft info, upload assets,
+# strip the pending warning) need contents: write; they only run on
+# workflow_run events. Fork pull requests still get a read-only token.
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_run' && 'release-drafter' || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build to Draft Release
+    # Builds daisy-blind.factory.yaml and, when triggered by a successful
+    # Release Drafter run, uploads the firmware to the current draft release.
+    uses: esphome/workflows/.github/workflows/build-to-draft-release.yml@0fdd5e311b7e744069166696072a1a9cbc5fbeb6  # 2026.8.1
+    with:
+      files: daisy-blind.factory.yaml
+      combined-name: daisy-blind
+      esphome-version: 2026.9.0

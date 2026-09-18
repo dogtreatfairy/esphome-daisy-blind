@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Daisy Blind - factory firmware
+#
+# This is what the GitHub workflow compiles and what the web installer flashes.
+# It wraps the core configuration with the bits a brand new board needs:
+# project identification, dashboard adoption, WiFi provisioning over USB, and
+# self-update from the published release manifest. Once you adopt the device
+# in your ESPHome dashboard, your copy only references daisy-blind.yaml.
+# ---------------------------------------------------------------------------
+
+packages:
+  core: !include daisy-blind.yaml
+
+esphome:
+  project:
+    name: dogtreatfairy.daisy-blind
+    version: dev  # replaced by the GitHub workflow with the release version
+
+# Lets the ESPHome dashboard discover the device and offer "Adopt".
+dashboard_import:
+  package_import_url: github://dogtreatfairy/esphome-daisy-blind/daisy-blind.yaml@main
+  import_full_config: false
+
+# WiFi provisioning over the USB serial port from the web installer.
+improv_serial:
+
+# Self-update from the latest published release. The ESP8266 cannot verify
+# TLS certificates, so the download is HTTPS without verification.
+http_request:
+  verify_ssl: false
+
+ota:
+  - platform: http_request
+    id: ota_http_request
+
+update:
+  - platform: http_request
+    name: Firmware update
+    id: update_http_request
+    source: https://dogtreatfairy.github.io/esphome-daisy-blind/firmware/daisy-blind.manifest.json

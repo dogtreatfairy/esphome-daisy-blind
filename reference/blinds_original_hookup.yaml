@@ -1,0 +1,225 @@
+esphome:
+  name: family_blinds
+  platform: ESP8266
+  board: nodemcuv2
+  esp8266_restore_from_flash: True
+  on_boot:
+    - priority: -200.0
+      then:
+      - stepper.report_position: # Set stepper to global variable
+          id: stepper_motor
+          position: !lambda return id(stepper_motor_global);
+      - stepper.set_target: # Set stepper to global variable
+          id: stepper_motor
+          target: !lambda return id(stepper_motor_global);
+      - if: # If blind is Closed
+          condition:
+            - lambda: 'return id(stepper_motor_global) == 0;'
+          then: # Publish state etc.
+            - cover.template.publish:
+                id: family_blinds
+                state: CLOSED
+                current_operation: IDLE
+      - if: # If blind is Open
+          condition:
+            - lambda: 'return id(stepper_motor_global) == id(endstop);'
+          then: # Publish state etc.
+            - cover.template.publish:
+                id: family_blinds
+                state: OPEN
+                current_operation: IDLE
+      - if: # If blind is Neither
+          condition:
+            - lambda: 'return (id(stepper_motor_global) != 0) && (id(stepper_motor_global) != id(endstop));'
+          then: #  # Publish state etc.
+            - cover.template.publish:
+                id: family_blinds
+                position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+                current_operation: IDLE
+                
+wifi:
+  ssid: XXXXXX
+  password: XXXXXXX
+  fast_connect: true
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Family Blinds Fallback Hotspot"
+    password: XXXXXXX
+
+captive_portal:
+
+web_server:
+  port: 80
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  password: XXXXXXX
+
+ota:
+  password: XXXXXXX
+
+globals:
+  - id: stepper_motor_global # Integer for storing the stepper position in case of reboot
+    type: int
+    restore_value: True
+    initial_value: '0'
+
+  - id: openclosed # Boolean to store OPEN/CLOSED state
+    type: bool
+    restore_value: True
+    initial_value: '0'
+
+  - id: endstop # Variable for storing ENDSTOP (how far to move stepper)
+    type: int
+    restore_value: True
+    initial_value: '750'   # this is the max value
+
+
+stepper:
+  - platform: a4988
+    id: stepper_motor
+    step_pin: D7
+    dir_pin: 
+      number: D6
+      inverted: true   
+    sleep_pin: 
+      number: D5
+      inverted: true  # inverted since using enable pin
+    max_speed: 250
+    
+cover:
+  - platform: template
+    name: Family Room Blinds
+    id: family_blinds
+    open_action:
+      then:
+        - logger.log: "Opening"
+        - stepper.set_target: 
+            id: stepper_motor
+            target: 750
+        - while:
+            condition:
+              lambda: 'return id(stepper_motor).current_position < id(endstop);'
+            then:
+              - cover.template.publish:
+                  id: family_blinds
+                  position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+                  current_operation: OPENING
+              - delay: 1000 ms
+        - globals.set: # Set global to current position
+            id: stepper_motor_global
+            value: !lambda return id(stepper_motor).current_position; 
+        - globals.set: # Set toggle to OPEN (No need for 'optimistic mode')
+            id: openclosed
+            value: '1'
+        - cover.template.publish:
+            id: family_blinds
+            state: OPEN 
+            current_operation: IDLE
+    close_action:
+      then:
+        - logger.log: "Closing"
+        - stepper.set_target: # Send stepper to 0
+            id: stepper_motor
+            target: '0'
+        - while:
+            condition:
+              lambda: 'return id(stepper_motor).current_position > 0;'
+            then:
+              - cover.template.publish:
+                  id: family_blinds
+                  position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+                  current_operation: CLOSING
+              - delay: 1000 ms
+        - globals.set: # Set global to current position
+            id: stepper_motor_global
+            value: !lambda return id(stepper_motor).current_position; 
+        - globals.set: # Set toggle to CLOSED (No need for 'optimistic mode')
+            id: openclosed
+            value: '0'
+        - cover.template.publish:
+            id: family_blinds
+            state: CLOSED
+            current_operation: IDLE
+    position_action:
+      then:
+        - stepper.set_target:
+            id: stepper_motor
+            target: !lambda return int(id(endstop) * pos);
+        - while:
+            condition:
+              lambda: 'return id(stepper_motor).current_position != int(id(endstop) * pos);'
+            then:
+              - cover.template.publish:
+                  id: family_blinds
+                  position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+              - delay: 1000 ms
+        - globals.set: # Set global to current position
+            id: stepper_motor_global
+            value: !lambda return id(stepper_motor).current_position; 
+        - cover.template.publish:
+            id: family_blinds
+            position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+            current_operation: IDLE
+    stop_action:
+      then:
+        - stepper.set_target:
+            id: stepper_motor
+            target: !lambda return id(stepper_motor).current_position;
+        - globals.set: # Set global to current position
+            id: stepper_motor_global
+            value: !lambda return id(stepper_motor).current_position;
+        - cover.template.publish:
+            id: family_blinds
+            position: !lambda 'return (float(float(id(stepper_motor).current_position) / float(id(endstop))));' 
+            current_operation: IDLE
+    has_position: true
+    device_class: blind
+
+switch:
+  - platform: template
+    name: Reset Family Room Blinds
+    id: reset
+    turn_on_action:
+      - stepper.set_target:
+          id: stepper_motor
+          target: '1500'
+      - wait_until: 
+          lambda: 'return id(stepper_motor).current_position == 1500;'
+      - delay: 1s
+      - stepper.set_target:
+          id: stepper_motor
+          target: '0'
+      - globals.set: # Set global to current position
+          id: stepper_motor_global
+          value: !lambda return id(stepper_motor).current_position; 
+      - globals.set: # Set toggle to CLOSED (No need for 'optimistic mode')
+          id: openclosed
+          value: '0'
+      - cover.template.publish:
+          id: family_blinds
+          state: CLOSED
+          current_operation: IDLE
+      - switch.turn_off: reset
+  - platform: restart
+    name: "Family Blinds Reboot"
+
+# Text sensors with general information.
+text_sensor:
+  # Expose WiFi information as sensors.
+  - platform: wifi_info
+    ip_address:
+      name: Family Blinds IP
+    ssid:
+      name: Family Blinds SSID
+
+
+# Sensors with general information.
+sensor:
+  # WiFi Signal sensor.
+  - platform: wifi_signal
+    name: Family Blinds WiFi Signal
+    update_interval: 60s
