@@ -20,7 +20,7 @@ esphome:
   name_add_mac_suffix: true
   project:
     name: dogtreatfairy.daisy-blind
-    version: "26.9.3"  # stamped by the Release workflow; factory builds override it
+    version: "26.9.4"  # stamped by the Release workflow; factory builds override it
   # Push restored settings into the controller once every entity has loaded.
   on_boot:
     priority: -100
