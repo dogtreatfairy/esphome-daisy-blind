@@ -111,6 +111,7 @@ device and survives reboots and power loss.
 | **Closed limit (steps)** | Step count that means fully closed. Default 0. |
 | **Motor speed (steps per second)** | Step rate. Default 250. |
 | **Nudge size (steps)** | How far the two Nudge buttons move the blind. Default 10. |
+| **Hotspot LED** | Blink the on-board LED while the blind has no WiFi connection. Default on. |
 | **Group control** | When on, opening or closing this blind also commands every blind in the group, and this blind follows their commands. Leave off if Home Assistant controls each blind individually. |
 
 ### Calibrating a blind
@@ -152,8 +153,25 @@ time, and every burst of motion ramps up from 60 steps per second rather than st
 full speed, which is where most skipped steps and the sharpest current spike come from.
 If a blind still skips steps, lower Vref on that driver or lower **Motor speed**.
 
-The NodeMCU's on-board LED blinks quickly while the setup hotspot is up or WiFi is down,
-and turns off once the blind is connected.
+The NodeMCU's on-board LED blinks while the blind is not connected to WiFi, which is when
+the setup hotspot is up, and turns off once connected. The **Hotspot LED** switch disables
+it.
+
+### WiFi fallback
+
+If the known network can't be reached for 30 seconds the `daisy-blind-xxxxxx` hotspot
+comes up so you can reach the device or point it at a new network. The blind keeps
+scanning for the known network the whole time and drops the hotspot as soon as it
+reconnects, so a router reboot heals itself. While someone is actually using the captive
+portal the reconnect attempts back off so they don't interrupt setup. After a power cycle
+the blind always tries the known network first.
+
+### Firmware version
+
+**Firmware version** on the device page shows the release the blind is running, such as
+`26.9.3`. Boards flashed from the installer report the release they were built from.
+Boards rebuilt by the ESPHome dashboard report the latest published release at the time
+they were compiled, which the Release workflow stamps into `daisy-blind.yaml`.
 
 The sync traffic is unauthenticated UDP that stays on your LAN; anyone on the LAN could
 send a move command. The factory firmware ships without an API key so the dashboard can

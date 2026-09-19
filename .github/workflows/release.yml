@@ -171,3 +171,26 @@ jobs:
             --field "draft=false" \
             --silent
           echo "Published ${TAG}"
+
+      # Devices adopted through the ESPHome dashboard build from daisy-blind.yaml
+      # on main, so record the published version there. [skip ci] keeps this
+      # commit from drafting a new release.
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+
+      - name: Stamp version into daisy-blind.yaml
+        env:
+          TAG: ${{ steps.find.outputs.tag }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s/^(    version: )\"[^\"]*\"(  # stamped by the Release workflow.*)$/\1\"${TAG}\"\2/" daisy-blind.yaml
+          if git diff --quiet; then
+            echo "Version already ${TAG}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Stamp firmware version ${TAG} [skip ci]"
+          git push origin HEAD:main

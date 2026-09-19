@@ -18,6 +18,9 @@ esphome:
   friendly_name: Daisy Blind
   # One firmware for every blind: the MAC is appended to the hostname.
   name_add_mac_suffix: true
+  project:
+    name: dogtreatfairy.daisy-blind
+    version: "26.9.3"  # stamped by the Release workflow; factory builds override it
   # Push restored settings into the controller once every entity has loaded.
   on_boot:
     priority: -100
@@ -47,9 +50,17 @@ external_components:
 # No credentials baked in. A fresh board starts an open access point named
 # daisy-blind-xxxxxx; join it, pick your WiFi in the captive portal, and it
 # reboots onto your network. Credentials are stored in flash.
+#
+# Fallback: if the known network can't be reached for 30 s the hotspot comes
+# up, but the board keeps scanning for the known network the whole time and
+# drops the hotspot as soon as it reconnects. While someone is using the
+# captive portal the reconnect attempts back off so they don't disrupt setup.
+# After a power cycle it always tries the known network first.
 wifi:
+  id: wifi_id
   power_save_mode: none
-  ap: {}
+  ap:
+    ap_timeout: 30s
 
 captive_portal:
 
@@ -90,12 +101,28 @@ web_server:
       name: Device
       sorting_weight: 50
 
-# On-board LED (D4, active low): blinks quickly while the setup hotspot is up
-# or WiFi is down, blinks slowly on a warning, and is off once connected.
-status_led:
-  pin:
-    number: D4
-    inverted: true
+# On-board LED (D4, active low) blinks while the board is not connected to a
+# WiFi network, i.e. while the setup hotspot is up. Off once connected.
+# Can be disabled with the "Hotspot LED" switch.
+output:
+  - platform: gpio
+    id: led_out
+    pin:
+      number: D4
+      inverted: true
+
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          static bool on = false;
+          const bool blink = id(hotspot_led).state && !id(wifi_id).is_connected();
+          on = blink && !on;
+          if (on) {
+            id(led_out).turn_on();
+          } else {
+            id(led_out).turn_off();
+          }
 
 # ---------------------------------------------------------------- the blind
 
@@ -293,6 +320,17 @@ switch:
       - lambda: id(blind).set_invert_direction(false);
 
   - platform: template
+    id: hotspot_led
+    name: Hotspot LED
+    icon: mdi:led-outline
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    web_server:
+      sorting_group_id: sg_setup
+      sorting_weight: 5
+
+  - platform: template
     id: group_control
     name: Group control
     web_server:
@@ -397,11 +435,20 @@ text_sensor:
         sorting_group_id: sg_device
         sorting_weight: 7
 
-  - platform: version
-    name: Firmware
+  - platform: template
+    name: Firmware version
+    icon: mdi:tag
+    update_interval: never
+    lambda: return {ESPHOME_PROJECT_VERSION};
     web_server:
       sorting_group_id: sg_device
       sorting_weight: 2
+
+  - platform: version
+    name: ESPHome version
+    web_server:
+      sorting_group_id: sg_device
+      sorting_weight: 10
 
 sensor:
   - platform: template
