@@ -15,7 +15,7 @@ move in unison.
 |---|---|
 | `daisy-blind.yaml` | Core configuration. This is what your ESPHome dashboard imports when you adopt a device. |
 | `daisy-blind.factory.yaml` | Wraps the core with adoption, USB WiFi provisioning and self-update. GitHub Actions compiles this into the firmware the web installer flashes. |
-| `components/daisy_blind/` | External component: stepper driver, peer discovery, slot sync, homing. |
+| `components/daisy_blind/` | External component: stepper driver, peer discovery, firing-order coordination. |
 | `static/` | The GitHub Pages installer site. |
 | `reference/blinds_original_hookup.yaml` | The single-blind ESPHome port this started from, unchanged, for reference. |
 
@@ -47,6 +47,10 @@ from `sleep_pin` in your adopted config.
 3. **Repeat** for each board. One firmware serves all of them because the hostname
    includes the MAC address.
 4. **Calibrate** each blind from its web page or Home Assistant device page (below).
+5. **Rename** a blind by editing the `friendly_name` substitution in the config the
+   dashboard created for it, then Install. Leave `name` alone: that is the hostname Home
+   Assistant and the dashboard use to find the board, and changing it makes the device
+   look like a new one. Renaming the device in Home Assistant's UI also works.
 
 Later updates come three ways: the ESPHome dashboard rebuilds from the latest `main`
 whenever you press Install, the device's own **Firmware update** entity pulls the latest
@@ -57,26 +61,37 @@ and install it over USB. The component is fetched from GitHub automatically.
 
 ## How the current sharing works
 
-Every blind broadcasts a small UDP beacon on the LAN once a second (every 300 ms while
-moving). From those beacons each device builds a list of peers in its **Sync group**.
+Think of the blinds as cylinders in an engine. Every blind broadcasts a small UDP
+beacon on the LAN once a second (every 300 ms while moving) saying which **Group** it
+belongs to, its **Firing order**, and whether it is moving. Nothing else is configured.
 
-When a blind has to move it only steps during its own **time slot**. The slot cycle is
-`slot length × number of blinds currently moving`. With the default 250 ms slots and four
-blinds moving, blind 1 steps during 0–250 ms of each second, blind 2 during 250–500 ms,
-and so on. Between slots the A4988 is put to sleep, so only one motor is energised at any
-instant. Idle blinds are not part of the cycle, so a blind moving alone runs at full
-speed with no gaps.
+When a blind receives a position command it waits a quarter of a second so that peers
+that got the same command can announce themselves, then looks at who else in the group
+is moving:
 
-All devices in a group agree on slot boundaries by adopting the millisecond clock of the
-peer with the lowest MAC address. No NTP or Home Assistant involvement is needed and it
-works without internet.
+- **Nobody else:** it moves at full speed, no gaps. Opening blind 2 on its own is never
+  slowed down by the others.
+- **Others too, "Take turns" mode (default):** a fixed one-second cycle is divided evenly
+  between the blinds that are moving. Four movers get 250 ms each, two get 500 ms each.
+  Each blind steps only in its own share, in firing order, and puts its A4988 to sleep in
+  between, so exactly one motor is energised at any instant. All of them start together
+  and finish at about the same time.
+- **Others too, "One at a time" mode:** the blind with the lowest firing order moves to
+  its target while the rest wait, then the next one goes, and so on. If any blind in the
+  group is set to this mode, the whole group uses it.
 
-Slot assignment is automatic (sorted by MAC address). If you prefer fixed slots, set
-**Sync slot** to 1–4 on each blind. Don't mix Auto and fixed within one group.
+The set of movers is re-evaluated continuously, so a new command arriving mid-move just
+changes who is in the cycle. A blind that has already started keeps its place ahead of a
+newcomer in one-at-a-time mode, so nothing pauses halfway.
 
-The trade-off: with four blinds moving, each one only steps a quarter of the time, so a
-full travel takes about four times longer than a lone blind. Raise **Motor speed** if the
-motors cope, or shorten the slot length for smoother-looking motion.
+Slot boundaries are agreed by adopting the millisecond clock of the peer with the lowest
+MAC address. No NTP or Home Assistant involvement is needed, and it works without
+internet. Ties in firing order are broken by MAC address, so leaving every blind at
+order 1 still works; set 1, 2, 3, 4 if you care which fires first.
+
+Bluetooth isn't an option here because the ESP8266 has no Bluetooth radio, and it
+wouldn't help anyway: the coordination needs tens of milliseconds of accuracy and LAN
+broadcast delivers that comfortably.
 
 ## Settings
 
@@ -85,41 +100,40 @@ below is stored on the device and survives reboots and power loss.
 
 | Setting | Meaning |
 |---|---|
-| **Label** | A friendly name that peers show in their "Peers in group" list, e.g. `Kitchen left`. The Home Assistant device name is renamed in Home Assistant itself. |
+| **Label** | A friendly name that peers show in their "Peers in group" list, e.g. `Kitchen left`. |
+| **Group** | Blinds with the same group number share the current budget. Default 1. |
+| **Firing order** | This blind's place in the cycle, 1–8. Default 1. |
+| **Coordination mode** | Take turns (interleaved, all move together) or One at a time. |
 | **Invert direction** | Flip if the blind opens when you ask it to close. |
-| **Open limit (steps)** | Steps from home to fully open. Default 750. |
-| **Closed limit (steps from home)** | Position considered fully closed. Usually 0. Set a few steps if you want the blind to back off the hard stop. |
-| **Homing distance (steps)** | How far the blind drives toward the closed stop when homing. Must exceed the full travel so it is guaranteed to hit the stop. Default 1500. |
+| **Open limit (steps)** | Step count that means fully open. Default 750. |
+| **Closed limit (steps)** | Step count that means fully closed. Default 0. |
 | **Motor speed (steps per second)** | Step rate. Default 250. |
-| **Sync group** | Blinds with the same group number share the current budget. Default 1. |
-| **Sync slot** | Auto, or a fixed slot 1–4. |
-| **Sync slot length (ms)** | Length of each blind's turn. Default 250. |
-| **Sync with peers** | Turn off to ignore peers and always move at full speed. |
-| **Sleep driver between slots** | De-energise the A4988 while waiting for the next turn. Leave on to actually reduce current. |
-| **Home after power loss** | Re-home automatically 20 s after a cold power-up (not after a software restart or OTA update). |
+| **Nudge size (steps)** | How far the two Nudge buttons move the blind. Default 10. |
 | **Group control** | When on, opening or closing this blind also commands every blind in the group, and this blind follows their commands. Leave off if Home Assistant controls each blind individually. |
 
 ### Calibrating a blind
 
-1. Press **Home now**. The blind drives into the closed stop and declares that position 0.
-2. Type a value into **Manual position (steps)** to jog the blind. Increase it until the
-   blind is exactly where you want fully open. If it goes the wrong way, toggle
-   **Invert direction**, home again and repeat.
-3. Press **Save current position as open limit**.
-4. Optionally jog back toward closed to the point you want as fully closed and press
-   **Save current position as closed limit**. Leave this at 0 to use the hard stop.
-5. Set **Homing distance** to comfortably more than the open limit (1.5× to 2× is fine).
+There is no automatic homing. Driving a 28BYJ-48 into a hard stop strips its plastic
+gears, and neither the A4988 nor the motor can sense a stall, so calibration is manual
+and the blind never deliberately hits an end.
 
-Position is remembered in flash and restored after a restart. After a power failure, if
-**Home after power loss** is on, all blinds in the group re-home together (taking turns in
-their slots) about 20 seconds after power returns, and report as closed.
+1. Type a value into **Manual position (steps)** to move the blind roughly to fully
+   closed. If it goes the wrong way, toggle **Invert direction**. Use **Nudge toward
+   open** and **Nudge toward closed** to creep the last few steps.
+2. Press **Save current position as closed limit**.
+3. Move to fully open the same way and press **Save current position as open limit**.
+
+The step counter is arbitrary; only the two saved limits matter. The blind's position is
+written to flash within a second during a move and within five seconds of any change, so
+after a power cut it comes back knowing where it was to within a few steps. If a blind
+ever loses steps under load, just nudge it back and re-save the limit it drifted from.
 
 ### Pairing blinds
 
-Give each blind the same **Sync group**. The **Peers in group** readout lists every other
-blind it can hear, with its label, hostname and position. **Sync status** shows which slot
-this blind has and whose clock it follows. That is all pairing takes; there is no master to
-configure.
+Give each blind the same **Group**. The **Peers in group** readout lists every other blind
+it can hear, with its firing order, label, hostname and position. **Coordination status**
+shows this blind's place in the cycle and which mode is in effect. That is all pairing
+takes; there is no master to configure.
 
 ## Home Assistant
 
@@ -131,9 +145,8 @@ and command any one of them.
 ## Notes on the electrical side
 
 The A4988 is a chopper driver, so a moving or holding motor draws roughly the current set
-by its Vref regardless of step rate. The slot scheme cuts the peak load to one motor at a
-time. If a blind still skips steps, lower Vref on that driver, lower **Motor speed**, or
-increase **Homing distance** so homing always reaches the stop.
+by its Vref regardless of step rate. The coordination cuts the peak load to one motor at a
+time. If a blind still skips steps, lower Vref on that driver or lower **Motor speed**.
 
 The sync traffic is unauthenticated UDP that stays on your LAN; anyone on the LAN could
 send a move command. The factory firmware ships without an API key so the dashboard can

@@ -29,7 +29,7 @@ Assistant then offers the device for integration.
 
 # Configure
 
-Open `http://daisy-blind-xxxxxx.local/` or the device page in Home Assistant. Home
-the blind, jog it to fully open with **Manual position**, press **Save current
-position as open limit**, and give every blind on the same power wire the same
-**Sync group**. The README on GitHub covers every setting.
+Open `http://daisy-blind-xxxxxx.local/` or the device page in Home Assistant. Move the
+blind to fully closed with **Manual position** and the **Nudge** buttons, press **Save
+current position as closed limit**, do the same for open, and give every blind on the
+same power wire the same **Group**. The README on GitHub covers every setting.

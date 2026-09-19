@@ -6,9 +6,8 @@
 # also included by daisy-blind.factory.yaml to build the pre-compiled firmware.
 #
 # Each board gets a unique hostname from its MAC address (daisy-blind-xxxxxx).
-# Everything else - label, direction, open and closed limits, homing distance,
-# speed, sync group and slot - is set at runtime from the device's own web
-# page or from Home Assistant.
+# Everything else - label, direction, open and closed limits, group, firing
+# order - is set at runtime from the device's own web page or Home Assistant.
 #
 # Wiring follows The Hookup's BlindsMCU:  D7 = STEP, D6 = DIR, D5 = ENABLE.
 # https://github.com/dogtreatfairy/esphome-daisy-blind
@@ -26,21 +25,20 @@ esphome:
       - lambda: |-
           id(blind).set_open_steps((int32_t) id(open_limit).state);
           id(blind).set_closed_steps((int32_t) id(closed_limit).state);
-          id(blind).set_homing_steps((int32_t) id(homing_steps).state);
           id(blind).set_speed((int32_t) id(motor_speed).state);
-          id(blind).set_slot_ms((int32_t) id(slot_length).state);
           id(blind).set_group((int32_t) id(sync_group).state);
-          id(blind).set_slot_mode(id(sync_slot).active_index().value_or(0));
+          id(blind).set_order((int32_t) id(firing_order).state);
+          id(blind).set_one_at_a_time(id(coordination_mode).active_index().value_or(0) == 1);
           id(blind).set_invert_direction(id(invert_direction).state);
-          id(blind).set_sync_enabled(id(sync_enabled).state);
-          id(blind).set_sleep_between_slots(id(sleep_between_slots).state);
-          id(blind).set_home_on_boot(id(home_on_boot).state);
           id(blind).set_group_control(id(group_control).state);
           id(blind).set_label(id(blind_label).state);
 
 esp8266:
   board: nodemcuv2
   restore_from_flash: true   # settings and position survive power loss
+
+preferences:
+  flash_write_interval: 5s   # position reaches flash within 5 s of a change
 
 external_components:
   - source: github://dogtreatfairy/esphome-daisy-blind@main
@@ -85,7 +83,7 @@ cover:
     sleep_pin:            # wired to the A4988 ENABLE pin, hence inverted
       number: D5
       inverted: true
-    port: 44820           # UDP port used for peer discovery and sync
+    port: 44820           # UDP port used for peer discovery and coordination
 
 # ---------------------------------------------------------------- settings
 
@@ -106,13 +104,43 @@ text:
 
 number:
   - platform: template
+    id: sync_group
+    name: Group
+    icon: mdi:account-group
+    optimistic: true
+    restore_value: true
+    initial_value: 1
+    min_value: 1
+    max_value: 9
+    step: 1
+    mode: box
+    entity_category: config
+    on_value:
+      - lambda: id(blind).set_group((int32_t) x);
+
+  - platform: template
+    id: firing_order
+    name: Firing order
+    icon: mdi:sort-numeric-ascending
+    optimistic: true
+    restore_value: true
+    initial_value: 1
+    min_value: 1
+    max_value: 8
+    step: 1
+    mode: box
+    entity_category: config
+    on_value:
+      - lambda: id(blind).set_order((int32_t) x);
+
+  - platform: template
     id: open_limit
     name: Open limit (steps)
     icon: mdi:arrow-expand-up
     optimistic: true
     restore_value: true
     initial_value: 750
-    min_value: 1
+    min_value: -50000
     max_value: 50000
     step: 1
     mode: box
@@ -122,33 +150,18 @@ number:
 
   - platform: template
     id: closed_limit
-    name: Closed limit (steps from home)
+    name: Closed limit (steps)
     icon: mdi:arrow-collapse-down
     optimistic: true
     restore_value: true
     initial_value: 0
-    min_value: 0
+    min_value: -50000
     max_value: 50000
     step: 1
     mode: box
     entity_category: config
     on_value:
       - lambda: id(blind).set_closed_steps((int32_t) x);
-
-  - platform: template
-    id: homing_steps
-    name: Homing distance (steps)
-    icon: mdi:home-import-outline
-    optimistic: true
-    restore_value: true
-    initial_value: 1500
-    min_value: 10
-    max_value: 50000
-    step: 10
-    mode: box
-    entity_category: config
-    on_value:
-      - lambda: id(blind).set_homing_steps((int32_t) x);
 
   - platform: template
     id: motor_speed
@@ -166,41 +179,24 @@ number:
       - lambda: id(blind).set_speed((int32_t) x);
 
   - platform: template
-    id: slot_length
-    name: Sync slot length (ms)
-    icon: mdi:timer-outline
+    id: nudge_size
+    name: Nudge size (steps)
+    icon: mdi:ruler
     optimistic: true
     restore_value: true
-    initial_value: 250
-    min_value: 50
-    max_value: 2000
-    step: 10
-    mode: box
-    entity_category: config
-    on_value:
-      - lambda: id(blind).set_slot_ms((int32_t) x);
-
-  - platform: template
-    id: sync_group
-    name: Sync group
-    icon: mdi:account-group
-    optimistic: true
-    restore_value: true
-    initial_value: 1
+    initial_value: 10
     min_value: 1
-    max_value: 9
+    max_value: 500
     step: 1
     mode: box
     entity_category: config
-    on_value:
-      - lambda: id(blind).set_group((int32_t) x);
 
-  # Jog the blind to an absolute step count (ignores the limits) for calibration.
+  # Move the blind to an absolute step count (ignores the limits) for calibration.
   - platform: template
     id: manual_position
     name: Manual position (steps)
-    icon: mdi:ruler
-    min_value: -2000
+    icon: mdi:target
+    min_value: -50000
     max_value: 50000
     step: 1
     mode: box
@@ -211,16 +207,16 @@ number:
 
 select:
   - platform: template
-    id: sync_slot
-    name: Sync slot
-    icon: mdi:view-sequential
+    id: coordination_mode
+    name: Coordination mode
+    icon: mdi:engine
     optimistic: true
     restore_value: true
-    initial_option: Auto
-    options: [Auto, "1", "2", "3", "4"]
+    initial_option: Take turns
+    options: [Take turns, One at a time]
     entity_category: config
     on_value:
-      - lambda: id(blind).set_slot_mode((int32_t) i);
+      - lambda: id(blind).set_one_at_a_time(i == 1);
 
 switch:
   - platform: template
@@ -236,42 +232,6 @@ switch:
       - lambda: id(blind).set_invert_direction(false);
 
   - platform: template
-    id: sync_enabled
-    name: Sync with peers
-    icon: mdi:sync
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
-    entity_category: config
-    on_turn_on:
-      - lambda: id(blind).set_sync_enabled(true);
-    on_turn_off:
-      - lambda: id(blind).set_sync_enabled(false);
-
-  - platform: template
-    id: sleep_between_slots
-    name: Sleep driver between slots
-    icon: mdi:power-sleep
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
-    entity_category: config
-    on_turn_on:
-      - lambda: id(blind).set_sleep_between_slots(true);
-    on_turn_off:
-      - lambda: id(blind).set_sleep_between_slots(false);
-
-  - platform: template
-    id: home_on_boot
-    name: Home after power loss
-    icon: mdi:home-clock
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
-    entity_category: config
-    on_turn_on:
-      - lambda: id(blind).set_home_on_boot(true);
-    on_turn_off:
-      - lambda: id(blind).set_home_on_boot(false);
-
-  - platform: template
     id: group_control
     name: Group control
     icon: mdi:link-variant
@@ -285,16 +245,16 @@ switch:
 
 button:
   - platform: template
-    name: Home now
-    icon: mdi:home-import-outline
+    name: Nudge toward open
+    icon: mdi:chevron-up
     on_press:
-      - lambda: id(blind).home();
+      - lambda: id(blind).nudge((int32_t) id(nudge_size).state);
 
   - platform: template
-    name: Home whole group
-    icon: mdi:home-group
+    name: Nudge toward closed
+    icon: mdi:chevron-down
     on_press:
-      - lambda: id(blind).home_group();
+      - lambda: id(blind).nudge(-(int32_t) id(nudge_size).state);
 
   - platform: template
     name: Save current position as open limit
@@ -332,8 +292,8 @@ text_sensor:
     lambda: return id(blind).peer_summary();
 
   - platform: template
-    name: Sync status
-    icon: mdi:sync-circle
+    name: Coordination status
+    icon: mdi:engine-outline
     update_interval: 5s
     lambda: return id(blind).sync_status();
 
