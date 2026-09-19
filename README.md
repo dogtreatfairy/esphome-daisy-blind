@@ -95,8 +95,10 @@ broadcast delivers that comfortably.
 
 ## Settings
 
-Open `http://daisy-blind-xxxxxx.local/` or the device page in Home Assistant. Everything
-below is stored on the device and survives reboots and power loss.
+Open `http://daisy-blind-xxxxxx.local/` or the device page in Home Assistant. The device
+page is laid out for a phone, follows its light or dark setting, and is split into Blind,
+Calibration, Coordination, Setup and Device sections. Everything below is stored on the
+device and survives reboots and power loss.
 
 | Setting | Meaning |
 |---|---|
@@ -105,7 +107,7 @@ below is stored on the device and survives reboots and power loss.
 | **Firing order** | This blind's place in the cycle, 1–8. Default 1. |
 | **Coordination mode** | Take turns (interleaved, all move together) or One at a time. |
 | **Invert direction** | Flip if the blind opens when you ask it to close. |
-| **Open limit (steps)** | Step count that means fully open. Default 750. |
+| **Open limit (steps)** | Step count that means fully open. Default 785. |
 | **Closed limit (steps)** | Step count that means fully closed. Default 0. |
 | **Motor speed (steps per second)** | Step rate. Default 250. |
 | **Nudge size (steps)** | How far the two Nudge buttons move the blind. Default 10. |
@@ -146,7 +148,12 @@ and command any one of them.
 
 The A4988 is a chopper driver, so a moving or holding motor draws roughly the current set
 by its Vref regardless of step rate. The coordination cuts the peak load to one motor at a
-time. If a blind still skips steps, lower Vref on that driver or lower **Motor speed**.
+time, and every burst of motion ramps up from 60 steps per second rather than starting at
+full speed, which is where most skipped steps and the sharpest current spike come from.
+If a blind still skips steps, lower Vref on that driver or lower **Motor speed**.
+
+The NodeMCU's on-board LED blinks quickly while the setup hotspot is up or WiFi is down,
+and turns off once the blind is connected.
 
 The sync traffic is unauthenticated UDP that stays on your LAN; anyone on the LAN could
 send a move command. The factory firmware ships without an API key so the dashboard can

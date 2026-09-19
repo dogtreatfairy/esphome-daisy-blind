@@ -129,7 +129,7 @@ class DaisyBlind : public cover::Cover, public Component {
   uint16_t port_{44820};
 
   // settings
-  int32_t open_steps_{750};
+  int32_t open_steps_{785};
   int32_t closed_steps_{0};
   int32_t speed_sps_{250};
   uint8_t group_{1};
@@ -149,6 +149,7 @@ class DaisyBlind : public cover::Cover, public Component {
   uint32_t hold_until_{0};
   uint32_t wake_until_{0};
   uint32_t last_step_us_{0};
+  float cur_sps_{0.0f};  // current step rate while ramping
   uint32_t last_step_ms_{0};
   uint32_t last_publish_ms_{0};
   uint32_t last_save_ms_{0};

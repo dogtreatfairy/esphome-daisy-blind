@@ -34,6 +34,8 @@ static const uint32_t DRIVER_WAKE_MS = 2;     // A4988 needs 1 ms after SLEEP/EN
 static const uint32_t IDLE_SLEEP_MS = 300;    // hold time before de-energising
 static const uint32_t PUBLISH_INTERVAL_MS = 500;
 static const uint32_t SAVE_INTERVAL_MS = 1000;
+static const float START_SPS = 60.0f;         // step rate a ramp begins from
+static const float ACCEL_SPS2 = 1500.0f;      // acceleration, steps per second squared
 static const int32_t MAX_MANUAL_STEPS = 50000;
 
 using cover::COVER_OPERATION_CLOSING;
@@ -224,8 +226,11 @@ void DaisyBlind::set_driver_awake_(bool awake, uint32_t now) {
   driver_awake_ = awake;
   if (sleep_pin_ != nullptr)
     sleep_pin_->digital_write(awake);
-  if (awake)
+  if (awake) {
     wake_until_ = now + DRIVER_WAKE_MS;
+    cur_sps_ = START_SPS;  // every burst of motion ramps up from rest
+    last_step_us_ = micros();
+  }
 }
 
 void DaisyBlind::save_position_() {
@@ -276,7 +281,19 @@ void DaisyBlind::run_motor_(uint32_t now) {
   if ((int32_t) (now - wake_until_) < 0)
     return;
 
-  const uint32_t interval_us = 1000000UL / (uint32_t) speed_sps_;
+  // Trapezoidal speed profile: ramp up from START_SPS, cruise at the configured
+  // speed, and ramp down so the final steps land gently on the target.
+  const float max_sps = (float) speed_sps_;
+  const int32_t remaining = target_ > position_ ? target_ - position_ : position_ - target_;
+  float sps = cur_sps_;
+  if (sps < START_SPS)
+    sps = START_SPS;
+  const float stop_sps = sqrtf(2.0f * ACCEL_SPS2 * (float) remaining + START_SPS * START_SPS);
+  if (sps > stop_sps)
+    sps = stop_sps;
+  if (sps > max_sps)
+    sps = max_sps;
+  const uint32_t interval_us = (uint32_t) (1000000.0f / sps);
   const uint32_t now_us = micros();
   if (now_us - last_step_us_ < interval_us)
     return;
@@ -286,6 +303,8 @@ void DaisyBlind::run_motor_(uint32_t now) {
   } else {
     last_step_us_ += interval_us;
   }
+  // Accelerate for the next step: v += a * dt.
+  cur_sps_ = sps + ACCEL_SPS2 * ((float) interval_us / 1000000.0f);
 
   const bool opening = target_ > position_;
   if (opening != last_dir_opening_ || last_step_ms_ == 0) {

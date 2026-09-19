@@ -66,8 +66,36 @@ ota:
   - platform: esphome
   - platform: web_server   # firmware upload form on the device page
 
+# Version 3 interface: single-column layout that fits a phone, follows the
+# phone's light/dark setting, and groups the controls into sections. Assets
+# are embedded so the page works with no internet.
 web_server:
   port: 80
+  version: 3
+  local: true
+  sorting_groups:
+    - id: sg_blind
+      name: Blind
+      sorting_weight: 10
+    - id: sg_calibration
+      name: Calibration
+      sorting_weight: 20
+    - id: sg_coordination
+      name: Coordination
+      sorting_weight: 30
+    - id: sg_setup
+      name: Setup
+      sorting_weight: 40
+    - id: sg_device
+      name: Device
+      sorting_weight: 50
+
+# On-board LED (D4, active low): blinks quickly while the setup hotspot is up
+# or WiFi is down, blinks slowly on a warning, and is off once connected.
+status_led:
+  pin:
+    number: D4
+    inverted: true
 
 # ---------------------------------------------------------------- the blind
 
@@ -75,6 +103,9 @@ cover:
   - platform: daisy_blind
     id: blind
     name: None            # takes the device's name in Home Assistant
+    web_server:
+      sorting_group_id: sg_blind
+      sorting_weight: 1
     device_class: blind
     step_pin: D7
     dir_pin:
@@ -91,6 +122,9 @@ text:
   - platform: template
     id: blind_label
     name: Label
+    web_server:
+      sorting_group_id: sg_setup
+      sorting_weight: 1
     icon: mdi:tag-text
     mode: text
     optimistic: true
@@ -106,6 +140,9 @@ number:
   - platform: template
     id: sync_group
     name: Group
+    web_server:
+      sorting_group_id: sg_coordination
+      sorting_weight: 1
     icon: mdi:account-group
     optimistic: true
     restore_value: true
@@ -121,6 +158,9 @@ number:
   - platform: template
     id: firing_order
     name: Firing order
+    web_server:
+      sorting_group_id: sg_coordination
+      sorting_weight: 2
     icon: mdi:sort-numeric-ascending
     optimistic: true
     restore_value: true
@@ -136,10 +176,13 @@ number:
   - platform: template
     id: open_limit
     name: Open limit (steps)
+    web_server:
+      sorting_group_id: sg_calibration
+      sorting_weight: 5
     icon: mdi:arrow-expand-up
     optimistic: true
     restore_value: true
-    initial_value: 750
+    initial_value: 785
     min_value: -50000
     max_value: 50000
     step: 1
@@ -151,6 +194,9 @@ number:
   - platform: template
     id: closed_limit
     name: Closed limit (steps)
+    web_server:
+      sorting_group_id: sg_calibration
+      sorting_weight: 4
     icon: mdi:arrow-collapse-down
     optimistic: true
     restore_value: true
@@ -166,6 +212,9 @@ number:
   - platform: template
     id: motor_speed
     name: Motor speed (steps per second)
+    web_server:
+      sorting_group_id: sg_setup
+      sorting_weight: 3
     icon: mdi:speedometer
     optimistic: true
     restore_value: true
@@ -181,6 +230,9 @@ number:
   - platform: template
     id: nudge_size
     name: Nudge size (steps)
+    web_server:
+      sorting_group_id: sg_blind
+      sorting_weight: 4
     icon: mdi:ruler
     optimistic: true
     restore_value: true
@@ -195,6 +247,9 @@ number:
   - platform: template
     id: manual_position
     name: Manual position (steps)
+    web_server:
+      sorting_group_id: sg_calibration
+      sorting_weight: 1
     icon: mdi:target
     min_value: -50000
     max_value: 50000
@@ -209,6 +264,9 @@ select:
   - platform: template
     id: coordination_mode
     name: Coordination mode
+    web_server:
+      sorting_group_id: sg_coordination
+      sorting_weight: 3
     icon: mdi:engine
     optimistic: true
     restore_value: true
@@ -222,6 +280,9 @@ switch:
   - platform: template
     id: invert_direction
     name: Invert direction
+    web_server:
+      sorting_group_id: sg_setup
+      sorting_weight: 2
     icon: mdi:swap-vertical
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
@@ -234,6 +295,9 @@ switch:
   - platform: template
     id: group_control
     name: Group control
+    web_server:
+      sorting_group_id: sg_setup
+      sorting_weight: 4
     icon: mdi:link-variant
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
@@ -246,18 +310,27 @@ switch:
 button:
   - platform: template
     name: Nudge toward open
+    web_server:
+      sorting_group_id: sg_blind
+      sorting_weight: 2
     icon: mdi:chevron-up
     on_press:
       - lambda: id(blind).nudge((int32_t) id(nudge_size).state);
 
   - platform: template
     name: Nudge toward closed
+    web_server:
+      sorting_group_id: sg_blind
+      sorting_weight: 3
     icon: mdi:chevron-down
     on_press:
       - lambda: id(blind).nudge(-(int32_t) id(nudge_size).state);
 
   - platform: template
     name: Save current position as open limit
+    web_server:
+      sorting_group_id: sg_calibration
+      sorting_weight: 3
     icon: mdi:content-save-move
     entity_category: config
     on_press:
@@ -267,6 +340,9 @@ button:
 
   - platform: template
     name: Save current position as closed limit
+    web_server:
+      sorting_group_id: sg_calibration
+      sorting_weight: 2
     icon: mdi:content-save-move-outline
     entity_category: config
     on_press:
@@ -276,10 +352,16 @@ button:
 
   - platform: restart
     name: Restart
+    web_server:
+      sorting_group_id: sg_device
+      sorting_weight: 8
     entity_category: diagnostic
 
   - platform: factory_reset
     name: Factory reset (forget WiFi)
+    web_server:
+      sorting_group_id: sg_device
+      sorting_weight: 9
     entity_category: diagnostic
 
 # ---------------------------------------------------------------- readouts
@@ -287,12 +369,18 @@ button:
 text_sensor:
   - platform: template
     name: Peers in group
+    web_server:
+      sorting_group_id: sg_coordination
+      sorting_weight: 5
     icon: mdi:lan
     update_interval: 5s
     lambda: return id(blind).peer_summary();
 
   - platform: template
     name: Coordination status
+    web_server:
+      sorting_group_id: sg_coordination
+      sorting_weight: 4
     icon: mdi:engine-outline
     update_interval: 5s
     lambda: return id(blind).sync_status();
@@ -300,15 +388,27 @@ text_sensor:
   - platform: wifi_info
     ip_address:
       name: IP address
+      web_server:
+        sorting_group_id: sg_device
+        sorting_weight: 6
     ssid:
       name: SSID
+      web_server:
+        sorting_group_id: sg_device
+        sorting_weight: 7
 
   - platform: version
     name: Firmware
+    web_server:
+      sorting_group_id: sg_device
+      sorting_weight: 2
 
 sensor:
   - platform: template
     name: Position (steps)
+    web_server:
+      sorting_group_id: sg_device
+      sorting_weight: 1
     icon: mdi:counter
     accuracy_decimals: 0
     update_interval: 2s
@@ -316,8 +416,14 @@ sensor:
 
   - platform: wifi_signal
     name: WiFi signal
+    web_server:
+      sorting_group_id: sg_device
+      sorting_weight: 5
     update_interval: 60s
 
 binary_sensor:
   - platform: status
     name: Status
+    web_server:
+      sorting_group_id: sg_device
+      sorting_weight: 4

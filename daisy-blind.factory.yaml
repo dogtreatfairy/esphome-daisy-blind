@@ -37,4 +37,7 @@ update:
   - platform: http_request
     name: Firmware update
     id: update_http_request
+    web_server:
+      sorting_group_id: sg_device
+      sorting_weight: 3
     source: https://dogtreatfairy.github.io/esphome-daisy-blind/firmware/daisy-blind.manifest.json
