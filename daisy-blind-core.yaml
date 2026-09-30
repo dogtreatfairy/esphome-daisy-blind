@@ -510,7 +510,7 @@ text_sensor:
   - platform: template
     name: Firmware version
     icon: mdi:tag
-    update_interval: never
+    update_interval: 60s
     lambda: return {ESPHOME_PROJECT_VERSION};
     web_server:
       sorting_group_id: sg_device
