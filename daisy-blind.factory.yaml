@@ -9,7 +9,7 @@
 # ---------------------------------------------------------------------------
 
 packages:
-  core: !include daisy-blind.yaml
+  core: !include daisy-blind-core.yaml
 
 esphome:
   project:

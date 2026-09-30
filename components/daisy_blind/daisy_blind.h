@@ -40,6 +40,26 @@ struct __attribute__((packed)) Packet {
   char label[NAME_LEN]; // user label
 };
 
+// Everything the blind must never forget, in one self-identifying record.
+// It lives in ESPHome's preference sector, but at boot the whole sector is
+// scanned for it (by key, checksum, magic and CRC) so it survives any change
+// in the order other settings are allocated, and the newest copy wins.
+struct __attribute__((packed)) StoredState {
+  uint32_t magic;
+  uint8_t version;
+  uint8_t flags;  // see STATE_FLAG_*
+  uint8_t group;
+  uint8_t order;
+  uint32_t seq;   // incremented on every save; highest wins
+  int32_t position;
+  int32_t open_steps;
+  int32_t closed_steps;
+  uint16_t speed;
+  uint16_t nudge;
+  char label[NAME_LEN];
+  uint32_t crc;
+};
+
 struct Peer {
   uint8_t mac[6];
   uint8_t group;
@@ -60,24 +80,51 @@ class DaisyBlind : public cover::Cover, public Component {
   void set_port(uint16_t port) { port_ = port; }
 
   // --- runtime settings (from template entities) ---
-  void set_open_steps(int32_t v) { open_steps_ = v; refresh_position_(); }
-  void set_closed_steps(int32_t v) { closed_steps_ = v; refresh_position_(); }
-  void set_speed(int32_t sps) { speed_sps_ = sps < 1 ? 1 : (sps > 5000 ? 5000 : sps); }
-  void set_group(int32_t g) { group_ = (uint8_t) (g < 1 ? 1 : (g > 255 ? 255 : g)); }
-  void set_order(int32_t o) { order_ = (uint8_t) (o < 1 ? 1 : (o > 8 ? 8 : o)); }
-  void set_one_at_a_time(bool v) { one_at_a_time_ = v; }
-  void set_invert_direction(bool v) { invert_direction_ = v; }
-  void set_group_control(bool v) { group_control_ = v; }
-  void set_label(const std::string &label) { label_ = label; }
+  // Before setup() these just seed values (the entities restore first); after
+  // setup() every change is written to the blind's own state record.
+  void set_open_steps(int32_t v) { open_steps_ = v; refresh_position_(); settings_changed_(); }
+  void set_closed_steps(int32_t v) { closed_steps_ = v; refresh_position_(); settings_changed_(); }
+  void set_speed(int32_t sps) { speed_sps_ = sps < 1 ? 1 : (sps > 5000 ? 5000 : sps); settings_changed_(); }
+  void set_group(int32_t g) { group_ = (uint8_t) (g < 1 ? 1 : (g > 255 ? 255 : g)); settings_changed_(); }
+  void set_order(int32_t o) { order_ = (uint8_t) (o < 1 ? 1 : (o > 8 ? 8 : o)); settings_changed_(); }
+  void set_one_at_a_time(bool v) { one_at_a_time_ = v; settings_changed_(); }
+  void set_invert_direction(bool v) {
+    if (v != invert_direction_)
+      dir_dirty_ = true;
+    invert_direction_ = v;
+    settings_changed_();
+  }
+  void set_group_control(bool v) { group_control_ = v; settings_changed_(); }
+  void set_hotspot_led(bool v) { hotspot_led_ = v; settings_changed_(); }
+  void set_nudge_size(int32_t v) { nudge_size_ = v < 1 ? 1 : (v > 5000 ? 5000 : v); settings_changed_(); }
+  void set_label(const std::string &label) { label_ = label; settings_changed_(); }
+
+  // --- stored values, for pushing into the entities at boot ---
+  int32_t get_open_steps() const { return open_steps_; }
+  int32_t get_closed_steps() const { return closed_steps_; }
+  int32_t get_speed() const { return speed_sps_; }
+  int32_t get_group() const { return group_; }
+  int32_t get_order() const { return order_; }
+  bool get_one_at_a_time() const { return one_at_a_time_; }
+  bool get_invert_direction() const { return invert_direction_; }
+  bool get_group_control() const { return group_control_; }
+  bool get_hotspot_led() const { return hotspot_led_; }
+  int32_t get_nudge_size() const { return nudge_size_; }
+  const std::string &get_label() const { return label_; }
 
   // --- actions ---
   void stop();
   void move_to_steps(int32_t steps);
   void nudge(int32_t delta);
+  void mark_closed();  // declare "the blind is fully closed right now"
+  void mark_open();    // declare "the blind is fully open right now"
+  bool needs_migration() const { return migrating_; }
+  void finish_migration();
 
   // --- readouts ---
   int32_t get_position_steps() const { return position_; }
   bool is_moving() const { return wants_move_(); }
+  bool is_position_known() const { return position_valid_; }
   std::string peer_summary();
   std::string sync_status();
 
@@ -85,6 +132,7 @@ class DaisyBlind : public cover::Cover, public Component {
   void setup() override;
   void loop() override;
   void dump_config() override;
+  void on_safe_shutdown() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
   cover::CoverTraits get_traits() override;
 
@@ -98,7 +146,10 @@ class DaisyBlind : public cover::Cover, public Component {
   void begin_move_(int32_t target, uint32_t now);
   void apply_target_pct_(float pct);
   void finish_move_(uint32_t now);
-  void save_position_();
+  void save_state_(bool flush);
+  void settings_changed_();
+  bool load_state_();
+  void set_position_known_(int32_t steps);
   float pos_pct_() const;
   void refresh_position_();
   void publish_(bool save, uint32_t now);
@@ -137,7 +188,21 @@ class DaisyBlind : public cover::Cover, public Component {
   bool one_at_a_time_{false};
   bool invert_direction_{false};
   bool group_control_{false};
+  bool hotspot_led_{true};
+  int32_t nudge_size_{10};
   std::string label_;
+
+  // persistence
+  bool loaded_{false};          // setup() finished loading state
+  bool migrating_{false};       // first boot after upgrade: waiting for entity values
+  bool position_valid_{false};  // position is trusted; cover moves allowed
+  bool state_dirty_{false};
+  uint32_t state_seq_{0};
+  uint32_t last_content_{0};
+  bool have_saved_{false};
+  uint32_t last_state_save_ms_{0};
+  ESPPreferenceObject state_pref_;
+  bool dir_dirty_{true};
 
   // motion state
   int32_t position_{0};
@@ -152,9 +217,8 @@ class DaisyBlind : public cover::Cover, public Component {
   float cur_sps_{0.0f};  // current step rate while ramping
   uint32_t last_step_ms_{0};
   uint32_t last_publish_ms_{0};
-  uint32_t last_save_ms_{0};
   HighFrequencyLoopRequester high_freq_;
-  ESPPreferenceObject pref_;
+  ESPPreferenceObject legacy_pref_;  // position record used up to 26.9.4, read once for migration
 
   // network state
   WiFiUDP udp_;

@@ -13,7 +13,8 @@ move in unison.
 
 | Path | What it is |
 |---|---|
-| `daisy-blind.yaml` | Core configuration. This is what your ESPHome dashboard imports when you adopt a device. |
+| `daisy-blind.yaml` | Small entry point that your ESPHome dashboard imports when you adopt a device. It pulls `daisy-blind-core.yaml` fresh from GitHub on every build. |
+| `daisy-blind-core.yaml` | The actual configuration. |
 | `daisy-blind.factory.yaml` | Wraps the core with adoption, USB WiFi provisioning and self-update. GitHub Actions compiles this into the firmware the web installer flashes. |
 | `components/daisy_blind/` | External component: stepper driver, peer discovery, firing-order coordination. |
 | `static/` | The GitHub Pages installer site. |
@@ -56,8 +57,11 @@ Later updates come three ways: the ESPHome dashboard rebuilds from the latest `m
 whenever you press Install, the device's own **Firmware update** entity pulls the latest
 published release, and the device web page has a firmware upload form.
 
+Adopted blinds never need re-adopting when this repo changes. Every Install from the
+ESPHome dashboard fetches the latest configuration and component code from GitHub.
+
 If you'd rather compile yourself, copy `daisy-blind.yaml` into your ESPHome directory
-and install it over USB. The component is fetched from GitHub automatically.
+and install it over USB. Everything else is fetched from GitHub automatically.
 
 ## How the current sharing works
 
@@ -111,6 +115,7 @@ device and survives reboots and power loss.
 | **Closed limit (steps)** | Step count that means fully closed. Default 0. |
 | **Motor speed (steps per second)** | Step rate. Default 250. |
 | **Nudge size (steps)** | How far the two Nudge buttons move the blind. Default 10. |
+| **Mark as fully closed / open** | Tell the blind it is exactly at its closed or open limit right now. Use this to correct a blind that has lost track. |
 | **Hotspot LED** | Blink the on-board LED while the blind has no WiFi connection. Default on. |
 | **Group control** | When on, opening or closing this blind also commands every blind in the group, and this blind follows their commands. Leave off if Home Assistant controls each blind individually. |
 
@@ -126,10 +131,25 @@ and the blind never deliberately hits an end.
 2. Press **Save current position as closed limit**.
 3. Move to fully open the same way and press **Save current position as open limit**.
 
-The step counter is arbitrary; only the two saved limits matter. The blind's position is
-written to flash within a second during a move and within five seconds of any change, so
-after a power cut it comes back knowing where it was to within a few steps. If a blind
-ever loses steps under load, just nudge it back and re-save the limit it drifted from.
+### Correcting a blind that has lost track
+
+If a blind is physically somewhere other than where it thinks it is, don't command it
+open or closed. Nudge it by hand from the device page until it is exactly fully closed,
+then press **Mark as fully closed**. The same works for fully open with **Mark as fully
+open**. The limits stay as they are; only the blind's idea of where it is changes.
+
+### How the blind remembers
+
+The blind keeps its position and every setting on this page in one record of its own.
+The record carries a marker, a sequence number and a checksum, and at boot the blind scans
+the whole settings area of flash for it. So it's found even when a firmware update changes
+the order ESPHome stores other things in, which is what used to make blinds forget. The
+position is cached every second while moving and written to flash when a move finishes.
+Before any firmware update or restart, the blind stops and writes its exact position.
+
+If a blind ever boots with no trustworthy position, **Position known** turns off. The blind
+then refuses open, close and position commands until you use **Mark as fully closed** or
+**Mark as fully open**. Nudges and Manual position still work so you can get it there.
 
 ### Pairing blinds
 
@@ -171,7 +191,7 @@ the blind always tries the known network first.
 **Firmware version** on the device page shows the release the blind is running, such as
 `26.9.3`. Boards flashed from the installer report the release they were built from.
 Boards rebuilt by the ESPHome dashboard report the latest published release at the time
-they were compiled, which the Release workflow stamps into `daisy-blind.yaml`.
+they were compiled, which the Release workflow stamps into `daisy-blind-core.yaml`.
 
 The sync traffic is unauthenticated UDP that stays on your LAN; anyone on the LAN could
 send a move command. The factory firmware ships without an API key so the dashboard can

@@ -172,7 +172,7 @@ jobs:
             --silent
           echo "Published ${TAG}"
 
-      # Devices adopted through the ESPHome dashboard build from daisy-blind.yaml
+      # Devices adopted through the ESPHome dashboard build from daisy-blind-core.yaml
       # on main, so record the published version there. [skip ci] keeps this
       # commit from drafting a new release.
       - name: Checkout main
@@ -180,12 +180,12 @@ jobs:
         with:
           ref: main
 
-      - name: Stamp version into daisy-blind.yaml
+      - name: Stamp version into daisy-blind-core.yaml
         env:
           TAG: ${{ steps.find.outputs.tag }}
         run: |
           set -euo pipefail
-          sed -i -E "s/^(    version: )\"[^\"]*\"(  # stamped by the Release workflow.*)$/\1\"${TAG}\"\2/" daisy-blind.yaml
+          sed -i -E "s/^(    version: )\"[^\"]*\"(  # stamped by the Release workflow.*)$/\1\"${TAG}\"\2/" daisy-blind-core.yaml
           if git diff --quiet; then
             echo "Version already ${TAG}"
             exit 0

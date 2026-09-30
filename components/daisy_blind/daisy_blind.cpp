@@ -7,6 +7,14 @@
 
 #include "esphome/core/application.h"
 #include "esphome/core/log.h"
+#include "esphome/core/preferences_rtc.h"
+
+#ifdef USE_ESP8266
+extern "C" {
+#include <spi_flash.h>
+}
+extern "C" uint32_t _SPIFFS_end;  // NOLINT: ESPHome's preference sector sits here
+#endif
 
 namespace esphome {
 namespace daisy_blind {
@@ -33,10 +41,36 @@ static const uint32_t HOLD_MS = 250;          // wait after a command so peers c
 static const uint32_t DRIVER_WAKE_MS = 2;     // A4988 needs 1 ms after SLEEP/ENABLE
 static const uint32_t IDLE_SLEEP_MS = 300;    // hold time before de-energising
 static const uint32_t PUBLISH_INTERVAL_MS = 500;
-static const uint32_t SAVE_INTERVAL_MS = 1000;
 static const float START_SPS = 60.0f;         // step rate a ramp begins from
 static const float ACCEL_SPS2 = 1500.0f;      // acceleration, steps per second squared
 static const int32_t MAX_MANUAL_STEPS = 50000;
+
+static const uint32_t STATE_MAGIC = 0x31534244;  // "DBS1"
+static const uint8_t STATE_VERSION = 1;
+static const uint32_t STATE_KEY = 0x6D0B1D57;    // fixed; never tied to entity names
+static const uint8_t STATE_FLAG_POSITION_VALID = 1;
+static const uint8_t STATE_FLAG_INVERT = 2;
+static const uint8_t STATE_FLAG_GROUP_CONTROL = 4;
+static const uint8_t STATE_FLAG_HOTSPOT_LED = 8;
+static const uint8_t STATE_FLAG_ONE_AT_A_TIME = 16;
+static const uint32_t STATE_WORDS = (sizeof(StoredState) + 3) / 4;
+static const uint32_t STATE_SAVE_INTERVAL_MS = 1000;  // throttle while moving
+static const uint32_t PREF_SECTOR_WORDS = 128;         // ESPHome flash preference area (restore_from_flash)
+
+static uint32_t state_crc(const StoredState &st) {
+  // FNV-1a over everything except the crc field itself.
+  const uint8_t *b = reinterpret_cast<const uint8_t *>(&st);
+  uint32_t h = 2166136261UL;
+  for (size_t i = 0; i < offsetof(StoredState, crc); i++) {
+    h ^= b[i];
+    h *= 16777619UL;
+  }
+  return h;
+}
+
+static bool state_ok(const StoredState &st) {
+  return st.magic == STATE_MAGIC && st.version == STATE_VERSION && st.crc == state_crc(st);
+}
 
 using cover::COVER_OPERATION_CLOSING;
 using cover::COVER_OPERATION_IDLE;
@@ -58,12 +92,32 @@ void DaisyBlind::setup() {
 
   get_mac_address_raw(mac_);
 
-  pref_ = global_preferences->make_preference<int32_t>(this->get_object_id_hash() ^ 0x44424C31);
-  int32_t saved = 0;
-  if (pref_.load(&saved)) {
-    position_ = saved;
-    ESP_LOGI(TAG, "Restored position %d steps", (int) position_);
+  // Allocation order matters on ESP8266: keep the legacy record first so the
+  // version being upgraded from can still be read, then the new record.
+  legacy_pref_ = global_preferences->make_preference<int32_t>(this->get_object_id_hash() ^ 0x44424C31);
+  state_pref_ = global_preferences->make_preference<StoredState>(STATE_KEY, true);
+
+  if (load_state_()) {
+    ESP_LOGI(TAG, "Loaded state: position %d steps%s, open %d, closed %d", (int) position_,
+             position_valid_ ? "" : " (UNKNOWN)", (int) open_steps_, (int) closed_steps_);
+  } else {
+    // First boot of this firmware: take settings from the entities (restored
+    // just before this component) and the position from the legacy record.
+    int32_t legacy = 0;
+    if (legacy_pref_.load(&legacy)) {
+      position_ = legacy;
+      position_valid_ = true;
+      ESP_LOGI(TAG, "Migrated position %d steps from previous firmware", (int) position_);
+    } else {
+      position_valid_ = false;
+      ESP_LOGW(TAG, "No stored position: cover moves are blocked until you mark the blind closed or open");
+    }
+    // Nothing is written until the YAML boot hook has copied every restored
+    // setting in and called finish_migration(), so a half-migrated record can
+    // never be saved.
+    migrating_ = true;
   }
+  loaded_ = true;
   target_ = position_;
 
   this->position = pos_pct_();
@@ -141,6 +195,13 @@ void DaisyBlind::control(const cover::CoverCall &call) {
 }
 
 void DaisyBlind::apply_target_pct_(float pct) {
+  if (!position_valid_) {
+    ESP_LOGW(TAG, "Position unknown: refusing to move. Nudge the blind fully closed or open, then press "
+                  "\"Mark as fully closed\" or \"Mark as fully open\".");
+    this->current_operation = COVER_OPERATION_IDLE;
+    publish_(false, millis());
+    return;
+  }
   if (pct < 0.0f)
     pct = 0.0f;
   if (pct > 1.0f)
@@ -193,6 +254,8 @@ void DaisyBlind::begin_move_(int32_t target, uint32_t now) {
 void DaisyBlind::stop() {
   target_ = position_;
   this->current_operation = COVER_OPERATION_IDLE;
+  if (state_dirty_)
+    save_state_(true);
   publish_(true, millis());
   if (udp_started_)
     send_beacon_(millis());
@@ -218,6 +281,156 @@ void DaisyBlind::publish_(bool save, uint32_t now) {
   last_publish_ms_ = now;
 }
 
+// ---------------------------------------------------------------- persistence
+
+bool DaisyBlind::load_state_() {
+  StoredState best{};
+  bool found = false;
+
+  StoredState st{};
+  bool in_slot = false;
+  if (state_pref_.load(&st) && state_ok(st)) {
+    best = st;
+    found = true;
+    in_slot = true;
+  }
+
+#ifdef USE_ESP8266
+  // Scan the raw preference sector so the record is found even if the order of
+  // other settings changed between firmware versions. Newest sequence wins.
+  static uint32_t raw[PREF_SECTOR_WORDS];
+  const uint32_t addr = (uint32_t) &_SPIFFS_end - 0x40200000UL;
+  if (spi_flash_read(addr, raw, sizeof(raw)) == SPI_FLASH_RESULT_OK) {
+    for (uint32_t off = 0; off + STATE_WORDS < PREF_SECTOR_WORDS; off++) {
+      StoredState cand{};
+      if (!rtc_pref_decode(raw + off, STATE_KEY, STATE_WORDS, reinterpret_cast<uint8_t *>(&cand), sizeof(cand)))
+        continue;
+      if (!state_ok(cand))
+        continue;
+      if (!found || (int32_t) (cand.seq - best.seq) > 0) {
+        ESP_LOGI(TAG, "Found state record at word %u (seq %u)", (unsigned) off, (unsigned) cand.seq);
+        best = cand;
+        found = true;
+        in_slot = false;
+      }
+    }
+  }
+#endif
+
+  if (!found)
+    return false;
+
+  state_seq_ = best.seq;
+  position_ = best.position;
+  position_valid_ = (best.flags & STATE_FLAG_POSITION_VALID) != 0;
+  open_steps_ = best.open_steps;
+  closed_steps_ = best.closed_steps;
+  speed_sps_ = best.speed < 1 ? 1 : best.speed;
+  nudge_size_ = best.nudge < 1 ? 1 : best.nudge;
+  group_ = best.group < 1 ? 1 : best.group;
+  order_ = best.order < 1 ? 1 : (best.order > 8 ? 8 : best.order);
+  invert_direction_ = (best.flags & STATE_FLAG_INVERT) != 0;
+  group_control_ = (best.flags & STATE_FLAG_GROUP_CONTROL) != 0;
+  hotspot_led_ = (best.flags & STATE_FLAG_HOTSPOT_LED) != 0;
+  one_at_a_time_ = (best.flags & STATE_FLAG_ONE_AT_A_TIME) != 0;
+  best.label[NAME_LEN - 1] = 0;
+  label_ = best.label;
+  dir_dirty_ = true;
+  loaded_ = true;
+  if (in_slot) {
+    // Already where this firmware expects it; remember it to avoid rewriting.
+    StoredState content = best;
+    content.seq = 0;
+    last_content_ = state_crc(content);
+    have_saved_ = true;
+  } else {
+    // Found elsewhere in the sector: rewrite into this firmware's slot.
+    ESP_LOGI(TAG, "Moving state record into this firmware's slot");
+    save_state_(true);
+  }
+  return true;
+}
+
+void DaisyBlind::save_state_(bool flush) {
+  if (!loaded_ || migrating_)
+    return;
+  StoredState st{};
+  st.magic = STATE_MAGIC;
+  st.version = STATE_VERSION;
+  st.flags = (position_valid_ ? STATE_FLAG_POSITION_VALID : 0) | (invert_direction_ ? STATE_FLAG_INVERT : 0) |
+             (group_control_ ? STATE_FLAG_GROUP_CONTROL : 0) | (hotspot_led_ ? STATE_FLAG_HOTSPOT_LED : 0) |
+             (one_at_a_time_ ? STATE_FLAG_ONE_AT_A_TIME : 0);
+  st.group = group_;
+  st.order = order_;
+  st.seq = 0;
+  st.position = position_;
+  st.open_steps = open_steps_;
+  st.closed_steps = closed_steps_;
+  st.speed = (uint16_t) speed_sps_;
+  st.nudge = (uint16_t) nudge_size_;
+  snprintf(st.label, NAME_LEN, "%s", label_.c_str());
+  // Skip the write if nothing changed (e.g. entities re-published at boot).
+  const uint32_t content = state_crc(st);
+  if (content == last_content_ && have_saved_) {
+    state_dirty_ = false;
+    return;
+  }
+  st.seq = ++state_seq_;
+  st.crc = state_crc(st);
+  if (!state_pref_.save(&st)) {
+    ESP_LOGE(TAG, "Failed to save state record");
+    return;
+  }
+  last_content_ = content;
+  have_saved_ = true;
+  state_dirty_ = false;
+  last_state_save_ms_ = millis();
+  if (flush)
+    global_preferences->sync();
+}
+
+void DaisyBlind::settings_changed_() {
+  if (loaded_ && !migrating_)
+    save_state_(true);
+}
+
+void DaisyBlind::finish_migration() {
+  if (!migrating_)
+    return;
+  migrating_ = false;
+  ESP_LOGI(TAG, "Migrated settings: open %d, closed %d, invert %s, group %u, order %u", (int) open_steps_,
+           (int) closed_steps_, invert_direction_ ? "on" : "off", group_, order_);
+  save_state_(true);
+}
+
+void DaisyBlind::set_position_known_(int32_t steps) {
+  target_ = position_ = steps;
+  position_valid_ = true;
+  this->current_operation = COVER_OPERATION_IDLE;
+  save_state_(true);
+  publish_(true, millis());
+  if (udp_started_)
+    send_beacon_(millis());
+}
+
+void DaisyBlind::mark_closed() {
+  ESP_LOGI(TAG, "Marked fully closed at %d steps", (int) closed_steps_);
+  set_position_known_(closed_steps_);
+}
+
+void DaisyBlind::mark_open() {
+  ESP_LOGI(TAG, "Marked fully open at %d steps", (int) open_steps_);
+  set_position_known_(open_steps_);
+}
+
+void DaisyBlind::on_safe_shutdown() {
+  // Reboot for an update or restart: stop cleanly and make sure the exact
+  // position reaches flash before the power goes.
+  target_ = position_;
+  set_driver_awake_(false, millis());
+  save_state_(true);
+}
+
 // ---------------------------------------------------------------- motor
 
 void DaisyBlind::set_driver_awake_(bool awake, uint32_t now) {
@@ -233,17 +446,12 @@ void DaisyBlind::set_driver_awake_(bool awake, uint32_t now) {
   }
 }
 
-void DaisyBlind::save_position_() {
-  pref_.save(&position_);
-  dirty_ = false;
-  last_save_ms_ = millis();
-}
-
 void DaisyBlind::finish_move_(uint32_t now) {
   set_driver_awake_(false, now);
   started_ = false;
-  if (dirty_) {
-    save_position_();
+  if (dirty_ || state_dirty_) {
+    dirty_ = false;
+    save_state_(true);  // flush now: a finished move must survive a power cut
     ESP_LOGI(TAG, "Move complete at %d steps (%d%%)", (int) position_, (int) lroundf(pos_pct_() * 100.0f));
   }
   this->current_operation = COVER_OPERATION_IDLE;
@@ -265,9 +473,10 @@ void DaisyBlind::run_motor_(uint32_t now) {
 
   high_freq_.start();
 
-  // Persist progress during long moves so a power cut loses at most a second.
-  if (dirty_ && now - last_save_ms_ >= SAVE_INTERVAL_MS)
-    save_position_();
+  // Persist progress during long moves. The record is cached in RAM every
+  // second and written to flash by ESPHome within flash_write_interval.
+  if (state_dirty_ && now - last_state_save_ms_ >= STATE_SAVE_INTERVAL_MS)
+    save_state_(false);
 
   if (!may_step_(now)) {
     set_driver_awake_(false, now);
@@ -307,9 +516,10 @@ void DaisyBlind::run_motor_(uint32_t now) {
   cur_sps_ = sps + ACCEL_SPS2 * ((float) interval_us / 1000000.0f);
 
   const bool opening = target_ > position_;
-  if (opening != last_dir_opening_ || last_step_ms_ == 0) {
+  if (opening != last_dir_opening_ || dir_dirty_) {
     dir_pin_->digital_write(opening != invert_direction_);
     last_dir_opening_ = opening;
+    dir_dirty_ = false;
     delayMicroseconds(5);
   }
 
@@ -321,6 +531,7 @@ void DaisyBlind::run_motor_(uint32_t now) {
 
   position_ += opening ? 1 : -1;
   dirty_ = true;
+  state_dirty_ = true;
 
   if (now - last_publish_ms_ >= PUBLISH_INTERVAL_MS) {
     this->current_operation = opening ? COVER_OPERATION_OPENING : COVER_OPERATION_CLOSING;
