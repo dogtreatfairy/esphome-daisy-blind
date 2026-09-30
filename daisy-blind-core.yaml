@@ -20,7 +20,7 @@ esphome:
   name_add_mac_suffix: true
   project:
     name: dogtreatfairy.daisy-blind
-    version: "26.9.4"  # stamped by the Release workflow; factory builds override it
+    version: "26.9.5"  # stamped by the Release workflow; factory builds override it
   # The blind keeps its own self-locating state record (position, limits,
   # direction, group, ...). On the first boot after upgrading from a version
   # without it, the settings are read from the restored entities into the
