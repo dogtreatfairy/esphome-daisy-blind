@@ -43,6 +43,9 @@ esphome:
             id(blind).set_hotspot_led(id(hotspot_led).state);
             id(blind).set_label(id(blind_label).state);
             id(blind).set_torque_limit((int32_t) id(torque_limit).state);
+            id(blind).set_homing_torque((int32_t) id(homing_torque).state);
+            id(blind).set_homing_overtravel((int32_t) id(homing_overtravel).state);
+            id(blind).set_home_on_power_loss(id(home_on_power_loss).state);
             id(blind).finish_migration();
             return;
           }
@@ -56,6 +59,11 @@ esphome:
           set_num(id(firing_order), id(blind).get_order());
           set_num(id(nudge_size), id(blind).get_nudge_size());
           set_num(id(torque_limit), id(blind).get_torque_limit());
+          set_num(id(homing_torque), id(blind).get_homing_torque());
+          set_num(id(homing_overtravel), id(blind).get_homing_overtravel());
+          if (id(home_on_power_loss).state != id(blind).get_home_on_power_loss()) {
+            if (id(blind).get_home_on_power_loss()) id(home_on_power_loss).turn_on(); else id(home_on_power_loss).turn_off();
+          }
           const size_t mode = id(blind).get_one_at_a_time() ? 1 : 0;
           if (id(coordination_mode).active_index().value_or(99) != mode) {
             auto c = id(coordination_mode).make_call(); c.set_index(mode); c.perform();
@@ -139,6 +147,9 @@ web_server:
     - id: sg_calibration
       name: Calibration
       sorting_weight: 20
+    - id: sg_homing
+      name: Homing
+      sorting_weight: 25
     - id: sg_coordination
       name: Coordination
       sorting_weight: 30
@@ -324,6 +335,45 @@ number:
     on_value:
       - lambda: id(blind).set_torque_limit((int32_t) x);
 
+  # Homing settings. Like Torque limit, these live in the blind's own state
+  # record rather than ESPHome restore, so adding them moves no saved setting.
+  - platform: template
+    id: homing_torque
+    name: Homing torque
+    icon: mdi:arm-flex-outline
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: false
+    initial_value: 30
+    min_value: 10
+    max_value: 100
+    step: 5
+    mode: box
+    entity_category: config
+    web_server:
+      sorting_group_id: sg_homing
+      sorting_weight: 3
+    on_value:
+      - lambda: id(blind).set_homing_torque((int32_t) x);
+
+  - platform: template
+    id: homing_overtravel
+    name: Homing overtravel (steps)
+    icon: mdi:arrow-collapse-down
+    optimistic: true
+    restore_value: false
+    initial_value: 150
+    min_value: 10
+    max_value: 5000
+    step: 1
+    mode: box
+    entity_category: config
+    web_server:
+      sorting_group_id: sg_homing
+      sorting_weight: 4
+    on_value:
+      - lambda: id(blind).set_homing_overtravel((int32_t) x);
+
   - platform: template
     id: nudge_size
     name: Nudge size (steps)
@@ -406,6 +456,23 @@ switch:
       sorting_group_id: sg_setup
       sorting_weight: 5
 
+  # ALWAYS_OFF means ESPHome reserves no flash for it; the real value is in
+  # the blind's state record and is copied in at boot.
+  - platform: template
+    id: home_on_power_loss
+    name: Home after power loss
+    icon: mdi:home-lightning-bolt-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    web_server:
+      sorting_group_id: sg_homing
+      sorting_weight: 2
+    on_turn_on:
+      - lambda: id(blind).set_home_on_power_loss(true);
+    on_turn_off:
+      - lambda: id(blind).set_home_on_power_loss(false);
+
   - platform: template
     id: group_control
     name: Group control
@@ -463,6 +530,24 @@ button:
       - number.set:
           id: closed_limit
           value: !lambda return id(blind).get_position_steps();
+
+  - platform: template
+    name: Home now
+    icon: mdi:home-import-outline
+    on_press:
+      - lambda: id(blind).home();
+    web_server:
+      sorting_group_id: sg_homing
+      sorting_weight: 1
+
+  - platform: template
+    name: Home whole group
+    icon: mdi:home-group
+    on_press:
+      - lambda: id(blind).home_group();
+    web_server:
+      sorting_group_id: sg_homing
+      sorting_weight: 5
 
   - platform: template
     name: Mark as fully closed

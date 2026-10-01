@@ -77,8 +77,11 @@ struct __attribute__((packed)) StoredState {
   uint16_t speed;
   uint16_t nudge;
   char label[NAME_LEN];
-  uint8_t torque;        // percent, 10..100
-  uint8_t reserved[11];  // zero; for future settings
+  uint8_t torque;             // percent, 10..100
+  int32_t home_pos;           // step count of the closed end stop (valid with STATE_FLAG_HOME_KNOWN)
+  uint8_t homing_torque;      // percent, 0 = default
+  uint16_t homing_overtravel; // steps beyond the expected distance, 0 = default
+  uint8_t reserved[4];        // zero; for future settings
   uint32_t crc;
 };
 
@@ -121,6 +124,9 @@ class DaisyBlind : public cover::Cover, public Component {
   void set_nudge_size(int32_t v) { nudge_size_ = v < 1 ? 1 : (v > 5000 ? 5000 : v); settings_changed_(); }
   void set_label(const std::string &label) { label_ = label; settings_changed_(); }
   void set_torque_limit(int32_t pct);
+  void set_homing_torque(int32_t pct);
+  void set_homing_overtravel(int32_t steps);
+  void set_home_on_power_loss(bool v) { home_on_power_loss_ = v; settings_changed_(); }
 
   // --- stored values, for pushing into the entities at boot ---
   int32_t get_open_steps() const { return open_steps_; }
@@ -135,11 +141,17 @@ class DaisyBlind : public cover::Cover, public Component {
   int32_t get_nudge_size() const { return nudge_size_; }
   const std::string &get_label() const { return label_; }
   int32_t get_torque_limit() const { return torque_limit_; }
+  int32_t get_homing_torque() const { return homing_torque_; }
+  int32_t get_homing_overtravel() const { return homing_overtravel_; }
+  bool get_home_on_power_loss() const { return home_on_power_loss_; }
 
   // --- actions ---
   void stop();
   void move_to_steps(int32_t steps);
   void nudge(int32_t delta);
+  void home();        // drive into the closed stop at homing torque, then return
+  void home_group();  // home this blind and ask every blind in the group to home
+  bool is_homing() const { return homing_; }
   void mark_closed();  // declare "the blind is fully closed right now"
   void mark_open();    // declare "the blind is fully open right now"
   bool needs_migration() const { return migrating_; }
@@ -164,10 +176,13 @@ class DaisyBlind : public cover::Cover, public Component {
   void control(const cover::CoverCall &call) override;
 
   // motion
-  bool wants_move_() const { return target_ != position_; }
+  bool wants_move_() const { return homing_ || target_ != position_; }
   void run_motor_(uint32_t now);
   void set_driver_awake_(bool awake, uint32_t now);
   void apply_enable_pin_(bool awake);
+  void start_home_(uint32_t now);
+  void finish_home_(uint32_t now);
+  void abort_home_(const char *why);
   void begin_move_(int32_t target, uint32_t now);
   void apply_target_pct_(float pct);
   void finish_move_(uint32_t now);
@@ -216,6 +231,18 @@ class DaisyBlind : public cover::Cover, public Component {
   bool hotspot_led_{true};
   int32_t nudge_size_{10};
   uint8_t torque_limit_{100};
+  uint8_t homing_torque_{30};
+  int32_t homing_overtravel_{150};
+  bool home_on_power_loss_{false};
+
+  // homing
+  bool homing_{false};
+  int32_t homing_remaining_{0};
+  int32_t restore_target_{0};
+  bool home_known_{false};
+  int32_t home_pos_{0};
+  uint32_t boot_ms_{0};
+  bool boot_home_pending_{false};
   std::string label_;
 
   // persistence

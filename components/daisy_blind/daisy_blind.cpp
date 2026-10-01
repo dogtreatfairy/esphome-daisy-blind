@@ -27,6 +27,7 @@ static const uint8_t PROTO_VERSION = 2;
 static const uint8_t TYPE_BEACON = 1;
 static const uint8_t TYPE_COMMAND = 2;
 static const uint8_t CMD_GOTO = 0;
+static const uint8_t CMD_HOME = 1;
 static const uint8_t CMD_STOP = 2;
 static const uint8_t FLAG_MOVING = 1;
 static const uint8_t FLAG_STARTED = 2;
@@ -56,12 +57,22 @@ static const uint8_t STATE_FLAG_INVERT = 2;
 static const uint8_t STATE_FLAG_GROUP_CONTROL = 4;
 static const uint8_t STATE_FLAG_HOTSPOT_LED = 8;
 static const uint8_t STATE_FLAG_ONE_AT_A_TIME = 16;
+static const uint8_t STATE_FLAG_HOME_KNOWN = 32;
+static const uint8_t STATE_FLAG_HOME_ON_POWER_LOSS = 64;
 static const uint32_t STATE_WORDS_V1 = (sizeof(StoredStateV1) + 3) / 4;
 static const uint32_t STATE_WORDS = (sizeof(StoredState) + 3) / 4;
+// The record's size is part of its identity: changing it would orphan stored state.
+static_assert(sizeof(StoredStateV1) == 56, "StoredStateV1 layout must never change");
+static_assert(sizeof(StoredState) == 68, "StoredState must stay 68 bytes; use the reserved bytes");
 static const uint32_t STATE_SAVE_INTERVAL_MS = 1000;  // throttle while moving
 static const uint32_t PREF_SECTOR_WORDS = 128;         // ESPHome flash preference area (restore_from_flash)
 static const uint32_t TORQUE_PERIOD_US = 50;           // 20 kHz enable-pin pulsing, above hearing
 static const uint8_t TORQUE_MIN = 10;
+static const uint8_t HOMING_TORQUE_DEFAULT = 30;
+static const int32_t HOMING_OVERTRAVEL_DEFAULT = 150;
+static const uint32_t BOOT_HOME_MIN_MS = 20000;   // let WiFi connect and peers be heard first
+static const uint32_t BOOT_HOME_PEERS_MS = 5000;  // after the coordination socket opens
+static const uint32_t BOOT_HOME_MAX_MS = 90000;   // home anyway if WiFi never comes up
 
 template<typename T> static uint32_t state_crc(const T &st) {
   // FNV-1a over everything except the crc field itself.
@@ -148,6 +159,15 @@ void DaisyBlind::setup() {
   this->position = pos_pct_();
   this->current_operation = COVER_OPERATION_IDLE;
   this->publish_state(false);
+
+  // Remember whether this was a real power-up (not a restart or OTA update),
+  // so "Home after power loss" only runs after the power actually went away.
+  boot_ms_ = millis();
+#ifdef USE_ESP8266
+  const uint32_t reason = ESP.getResetInfoPtr()->reason;
+  boot_home_pending_ = (reason == REASON_DEFAULT_RST || reason == REASON_EXT_SYS_RST);
+  ESP_LOGI(TAG, "Reset reason: %s", ESP.getResetReason().c_str());
+#endif
 }
 
 void DaisyBlind::loop() {
@@ -166,6 +186,21 @@ void DaisyBlind::loop() {
       send_beacon_(now);
   }
 
+  if (boot_home_pending_) {
+    const uint32_t up = now - boot_ms_;
+    static uint32_t udp_since = 0;
+    if (udp_started_ && udp_since == 0)
+      udp_since = now | 1;
+    const bool ready = up >= BOOT_HOME_MIN_MS && udp_since != 0 && now - udp_since >= BOOT_HOME_PEERS_MS;
+    if (ready || up >= BOOT_HOME_MAX_MS) {
+      boot_home_pending_ = false;
+      if (home_on_power_loss_ && !homing_ && !migrating_) {
+        ESP_LOGI(TAG, "Power-up: homing to re-establish the position");
+        start_home_(now);
+      }
+    }
+  }
+
   run_motor_(now);
 }
 
@@ -175,7 +210,7 @@ void DaisyBlind::dump_config() {
   LOG_PIN("  Dir pin: ", dir_pin_);
   LOG_PIN("  Sleep/enable pin: ", sleep_pin_);
   ESP_LOGCONFIG(TAG, "  Coordination UDP port: %u", port_);
-  ESP_LOGCONFIG(TAG, "  Torque limit: %u%%", torque_limit_);
+  ESP_LOGCONFIG(TAG, "  Torque limit: %u%%, homing torque %u%%", torque_limit_, homing_torque_);
   ESP_LOGCONFIG(TAG, "  Position: %d steps (open=%d closed=%d)", (int) position_, (int) open_steps_,
                 (int) closed_steps_);
 }
@@ -221,6 +256,13 @@ void DaisyBlind::control(const cover::CoverCall &call) {
 }
 
 void DaisyBlind::apply_target_pct_(float pct) {
+  if (homing_) {
+    // Remember it: the blind goes there instead of its old position once homed.
+    float q = pct < 0.0f ? 0.0f : (pct > 1.0f ? 1.0f : pct);
+    restore_target_ = closed_steps_ + (int32_t) lroundf(q * (float) (open_steps_ - closed_steps_));
+    ESP_LOGI(TAG, "Homing in progress: will go to %d%% afterwards", (int) lroundf(q * 100.0f));
+    return;
+  }
   if (!position_valid_) {
     ESP_LOGW(TAG, "Position unknown: refusing to move. Nudge the blind fully closed or open, then press "
                   "\"Mark as fully closed\" or \"Mark as fully open\".");
@@ -243,6 +285,10 @@ void DaisyBlind::apply_target_pct_(float pct) {
 }
 
 void DaisyBlind::move_to_steps(int32_t steps) {
+  if (homing_) {
+    ESP_LOGW(TAG, "Homing in progress; manual move ignored");
+    return;
+  }
   if (steps > MAX_MANUAL_STEPS)
     steps = MAX_MANUAL_STEPS;
   if (steps < -MAX_MANUAL_STEPS)
@@ -278,6 +324,7 @@ void DaisyBlind::begin_move_(int32_t target, uint32_t now) {
 }
 
 void DaisyBlind::stop() {
+  abort_home_("stopped");
   target_ = position_;
   this->current_operation = COVER_OPERATION_IDLE;
   if (state_dirty_)
@@ -381,6 +428,13 @@ bool DaisyBlind::load_state_() {
   best.label[NAME_LEN - 1] = 0;
   label_ = best.label;
   torque_limit_ = best.torque < TORQUE_MIN ? TORQUE_MIN : (best.torque > 100 ? 100 : best.torque);
+  homing_torque_ = best.homing_torque == 0 ? HOMING_TORQUE_DEFAULT
+                                           : (best.homing_torque < TORQUE_MIN ? TORQUE_MIN
+                                                                              : (best.homing_torque > 100 ? 100 : best.homing_torque));
+  homing_overtravel_ = best.homing_overtravel == 0 ? HOMING_OVERTRAVEL_DEFAULT : best.homing_overtravel;
+  home_known_ = (best.flags & STATE_FLAG_HOME_KNOWN) != 0;
+  home_pos_ = best.home_pos;
+  home_on_power_loss_ = (best.flags & STATE_FLAG_HOME_ON_POWER_LOSS) != 0;
   dir_dirty_ = true;
   loaded_ = true;
   if (in_slot) {
@@ -405,7 +459,8 @@ void DaisyBlind::save_state_(bool flush) {
   st.version = STATE_VERSION;
   st.flags = (position_valid_ ? STATE_FLAG_POSITION_VALID : 0) | (invert_direction_ ? STATE_FLAG_INVERT : 0) |
              (group_control_ ? STATE_FLAG_GROUP_CONTROL : 0) | (hotspot_led_ ? STATE_FLAG_HOTSPOT_LED : 0) |
-             (one_at_a_time_ ? STATE_FLAG_ONE_AT_A_TIME : 0);
+             (one_at_a_time_ ? STATE_FLAG_ONE_AT_A_TIME : 0) | (home_known_ ? STATE_FLAG_HOME_KNOWN : 0) |
+             (home_on_power_loss_ ? STATE_FLAG_HOME_ON_POWER_LOSS : 0);
   st.group = group_;
   st.order = order_;
   st.seq = 0;
@@ -416,6 +471,9 @@ void DaisyBlind::save_state_(bool flush) {
   st.nudge = (uint16_t) nudge_size_;
   snprintf(st.label, NAME_LEN, "%s", label_.c_str());
   st.torque = torque_limit_;
+  st.home_pos = home_pos_;
+  st.homing_torque = homing_torque_;
+  st.homing_overtravel = (uint16_t) homing_overtravel_;
   // Skip the write if nothing changed (e.g. entities re-published at boot).
   const uint32_t content = state_crc(st);
   if (content == last_content_ && have_saved_) {
@@ -451,6 +509,7 @@ void DaisyBlind::finish_migration() {
 }
 
 void DaisyBlind::set_position_known_(int32_t steps) {
+  abort_home_("marked");
   target_ = position_ = steps;
   position_valid_ = true;
   this->current_operation = COVER_OPERATION_IDLE;
@@ -473,6 +532,7 @@ void DaisyBlind::mark_open() {
 void DaisyBlind::on_safe_shutdown() {
   // Reboot for an update or restart: stop cleanly and make sure the exact
   // position reaches flash before the power goes.
+  homing_ = false;  // position already saved as unknown when homing began
   target_ = position_;
   set_driver_awake_(false, millis());
   save_state_(true);
@@ -485,12 +545,13 @@ void DaisyBlind::apply_enable_pin_(bool awake) {
     return;
 #ifdef USE_ESP8266
   const uint8_t pin = sleep_pin_->get_pin();
-  if (awake && torque_limit_ < 100) {
+  const uint8_t torque = homing_ ? homing_torque_ : torque_limit_;
+  if (awake && torque < 100) {
     // Pulse the driver's enable input so the coils are powered only part of
     // the time: less average current, less torque. 20 kHz is above hearing and
     // far faster than the coil current can follow, so the motor sees a steady
     // reduced current rather than pulses.
-    const uint32_t on_us = (TORQUE_PERIOD_US * torque_limit_ + 50) / 100;
+    const uint32_t on_us = (TORQUE_PERIOD_US * torque + 50) / 100;
     const uint32_t off_us = TORQUE_PERIOD_US - on_us;
     const bool active_high = !sleep_pin_->is_inverted();
     if (active_high) {
@@ -515,6 +576,105 @@ void DaisyBlind::set_torque_limit(int32_t pct) {
   if (driver_awake_)
     apply_enable_pin_(true);
   settings_changed_();
+}
+
+void DaisyBlind::set_homing_torque(int32_t pct) {
+  const uint8_t v = (uint8_t) (pct < TORQUE_MIN ? TORQUE_MIN : (pct > 100 ? 100 : pct));
+  if (v == homing_torque_)
+    return;
+  homing_torque_ = v;
+  if (homing_ && driver_awake_)
+    apply_enable_pin_(true);
+  settings_changed_();
+}
+
+void DaisyBlind::set_homing_overtravel(int32_t steps) {
+  homing_overtravel_ = steps < 10 ? 10 : (steps > 5000 ? 5000 : steps);
+  settings_changed_();
+}
+
+// ---------------------------------------------------------------- homing
+
+void DaisyBlind::home() { start_home_(millis()); }
+
+void DaisyBlind::home_group() {
+  start_home_(millis());
+  send_command_(CMD_HOME, 0);
+}
+
+void DaisyBlind::start_home_(uint32_t now) {
+  if (homing_)
+    return;
+  if (sleep_pin_ == nullptr) {
+    ESP_LOGW(TAG, "Homing needs sleep_pin (the A4988 ENABLE pin) for its torque limit; not homing");
+    return;
+  }
+  const int32_t lo = closed_steps_ < open_steps_ ? closed_steps_ : open_steps_;
+  const int32_t hi = closed_steps_ < open_steps_ ? open_steps_ : closed_steps_;
+  // Return to where the blind last was (or was heading), kept within the limits.
+  int32_t back = wants_move_() ? target_ : position_;
+  restore_target_ = back < lo ? lo : (back > hi ? hi : back);
+
+  // Far enough to reach the stop from anywhere it could plausibly be.
+  int32_t distance;
+  if (position_valid_ && home_known_ && position_ >= home_pos_) {
+    distance = (position_ - home_pos_) + homing_overtravel_;
+  } else {
+    int32_t span = hi - lo;
+    if (home_known_ && home_pos_ < lo)
+      span += lo - home_pos_;
+    distance = span + homing_overtravel_;
+  }
+
+  homing_ = true;
+  homing_remaining_ = distance;
+  target_ = position_;
+  // If power is lost mid-homing the position must not be trusted afterwards.
+  position_valid_ = false;
+  save_state_(true);
+  hold_until_ = now + HOLD_MS;
+  started_ = false;
+  dir_dirty_ = true;
+  if (driver_awake_)
+    apply_enable_pin_(true);
+  this->current_operation = COVER_OPERATION_CLOSING;
+  ESP_LOGI(TAG, "Homing: up to %d steps toward closed at %u%% torque, then back to %d", (int) distance,
+           homing_torque_, (int) restore_target_);
+  publish_(false, now);
+  if (udp_started_)
+    send_beacon_(now);
+}
+
+void DaisyBlind::finish_home_(uint32_t now) {
+  homing_ = false;
+  if (!home_known_) {
+    // First home: the stop becomes the closed limit's reference point.
+    home_pos_ = closed_steps_;
+    home_known_ = true;
+    ESP_LOGI(TAG, "First home: end stop recorded at the closed limit (%d)", (int) home_pos_);
+  }
+  position_ = home_pos_;
+  position_valid_ = true;
+  target_ = restore_target_;
+  cur_sps_ = START_SPS;  // reverse gently, not at full speed
+  if (driver_awake_)
+    apply_enable_pin_(true);  // back to the normal torque limit
+  dir_dirty_ = true;
+  save_state_(true);
+  ESP_LOGI(TAG, "Homed at %d; returning to %d", (int) position_, (int) target_);
+  this->current_operation = target_ > position_ ? COVER_OPERATION_OPENING : COVER_OPERATION_IDLE;
+  publish_(false, now);
+}
+
+void DaisyBlind::abort_home_(const char *why) {
+  if (!homing_)
+    return;
+  homing_ = false;
+  target_ = position_;
+  if (driver_awake_)
+    apply_enable_pin_(true);
+  ESP_LOGW(TAG, "Homing stopped (%s); position unknown until homed or marked", why);
+  save_state_(true);
 }
 
 void DaisyBlind::set_driver_awake_(bool awake, uint32_t now) {
@@ -576,7 +736,9 @@ void DaisyBlind::run_motor_(uint32_t now) {
   // Trapezoidal speed profile: ramp up from START_SPS, cruise at the configured
   // speed, and ramp down so the final steps land gently on the target.
   const float max_sps = (float) speed_sps_;
-  const int32_t remaining = target_ > position_ ? target_ - position_ : position_ - target_;
+  // Homing runs at full speed into the stop (a stepper is weakest when fast),
+  // so it never decelerates.
+  const int32_t remaining = homing_ ? 1000000 : (target_ > position_ ? target_ - position_ : position_ - target_);
   float sps = cur_sps_;
   if (sps < START_SPS)
     sps = START_SPS;
@@ -598,7 +760,7 @@ void DaisyBlind::run_motor_(uint32_t now) {
   // Accelerate for the next step: v += a * dt.
   cur_sps_ = sps + ACCEL_SPS2 * ((float) interval_us / 1000000.0f);
 
-  const bool opening = target_ > position_;
+  const bool opening = homing_ ? false : target_ > position_;
   if (opening != last_dir_opening_ || dir_dirty_) {
     dir_pin_->digital_write(opening != invert_direction_);
     last_dir_opening_ = opening;
@@ -612,9 +774,15 @@ void DaisyBlind::run_motor_(uint32_t now) {
   last_step_ms_ = now;
   started_ = true;
 
-  position_ += opening ? 1 : -1;
-  dirty_ = true;
-  state_dirty_ = true;
+  if (homing_) {
+    // Steps into the stop don't move the blind; the count resets at the end.
+    if (--homing_remaining_ <= 0)
+      finish_home_(now);
+  } else {
+    position_ += opening ? 1 : -1;
+    dirty_ = true;
+    state_dirty_ = true;
+  }
 
   if (now - last_publish_ms_ >= PUBLISH_INTERVAL_MS) {
     this->current_operation = opening ? COVER_OPERATION_OPENING : COVER_OPERATION_CLOSING;
@@ -765,6 +933,12 @@ void DaisyBlind::receive_packets_(uint32_t now) {
 }
 
 void DaisyBlind::handle_command_(const Packet &p) {
+  if (p.cmd == CMD_HOME) {
+    // An explicit "home the group" press is honoured regardless of Group control.
+    ESP_LOGI(TAG, "Group home requested by %.*s", (int) NAME_LEN, p.name);
+    start_home_(millis());
+    return;
+  }
   if (!group_control_)
     return;
   switch (p.cmd) {
@@ -856,6 +1030,8 @@ std::string DaisyBlind::peer_summary() {
 }
 
 std::string DaisyBlind::sync_status() {
+  if (homing_)
+    return "Homing";
   const uint32_t now = millis();
   bool one_at_a_time = false;
   auto list = participants_(now, false, one_at_a_time);

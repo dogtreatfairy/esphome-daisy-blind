@@ -180,6 +180,37 @@ It needs the ENABLE pin wired to `sleep_pin`, as in the standard wiring. Every m
 starts and ends at 180 steps per second rather than crawling, because a stepper is strongest
 at low speed and the ends are where it meets the stops.
 
+### Homing
+
+Homing drives the blind into its closed end stop at a deliberately weak **Homing torque**,
+lets it stall there, takes that stop as a fixed reference, and then sends the blind back to
+where it last was (or to wherever you commanded it while it was homing). It runs at full
+speed with no slow approach, because a stepper is weakest when fast.
+
+**Set the homing torque before you use it.** It must be strong enough to move the blind but
+too weak to strip the gears when it reaches the stop:
+
+1. With the blind's position correct, set **Homing torque** to 20% and press **Home now**.
+2. Watch it. It should close, buzz briefly against the stop without forcing it, then return.
+3. If it didn't reach the closed end, raise it by 5% and try again. Use the lowest value
+   that reaches the stop every time.
+
+The first successful home records the stop at your current **Closed limit**. If the stop is
+a little past where you consider fully closed, nudge the blind there after homing and press
+**Save current position as closed limit**. The open limit can be re-saved the same way.
+
+| Setting | Meaning |
+|---|---|
+| **Home now** | Home this blind. |
+| **Home whole group** | Home every blind in the group, one at a time. |
+| **Home after power loss** | Home automatically after the power comes back. Not after a restart or update. Off by default. |
+| **Homing torque** | Motor strength while homing, 10 to 100%. Default 30. |
+| **Homing overtravel (steps)** | Extra steps beyond the expected distance, so the stop is always reached. Default 150. |
+
+After a power cut, homing waits until WiFi is up and the other blinds have been heard, so a
+group comes back one at a time. Pressing Stop while homing cancels it and leaves the position
+unknown until the blind is homed or marked.
+
 ## Home Assistant
 
 Each blind appears as a `cover` with position, plus all the settings above as config
