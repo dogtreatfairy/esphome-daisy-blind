@@ -10,6 +10,7 @@
 #include "esphome/core/preferences_rtc.h"
 
 #ifdef USE_ESP8266
+#include <core_esp8266_waveform.h>
 extern "C" {
 #include <spi_flash.h>
 }
@@ -41,35 +42,59 @@ static const uint32_t HOLD_MS = 250;          // wait after a command so peers c
 static const uint32_t DRIVER_WAKE_MS = 2;     // A4988 needs 1 ms after SLEEP/ENABLE
 static const uint32_t IDLE_SLEEP_MS = 300;    // hold time before de-energising
 static const uint32_t PUBLISH_INTERVAL_MS = 500;
-static const float START_SPS = 60.0f;         // step rate a ramp begins from
+static const float START_SPS = 180.0f;        // step rate a ramp begins and ends at (higher = gentler at the ends)
 static const float ACCEL_SPS2 = 1500.0f;      // acceleration, steps per second squared
 static const int32_t MAX_MANUAL_STEPS = 50000;
 
 static const uint32_t STATE_MAGIC = 0x31534244;  // "DBS1"
-static const uint8_t STATE_VERSION = 1;
-static const uint32_t STATE_KEY = 0x6D0B1D57;    // fixed; never tied to entity names
+static const uint8_t STATE_VERSION_V1 = 1;
+static const uint8_t STATE_VERSION = 2;
+static const uint32_t STATE_KEY_V1 = 0x6D0B1D57;  // fixed; never tied to entity names
+static const uint32_t STATE_KEY = 0x6D0B1D58;
 static const uint8_t STATE_FLAG_POSITION_VALID = 1;
 static const uint8_t STATE_FLAG_INVERT = 2;
 static const uint8_t STATE_FLAG_GROUP_CONTROL = 4;
 static const uint8_t STATE_FLAG_HOTSPOT_LED = 8;
 static const uint8_t STATE_FLAG_ONE_AT_A_TIME = 16;
+static const uint32_t STATE_WORDS_V1 = (sizeof(StoredStateV1) + 3) / 4;
 static const uint32_t STATE_WORDS = (sizeof(StoredState) + 3) / 4;
 static const uint32_t STATE_SAVE_INTERVAL_MS = 1000;  // throttle while moving
 static const uint32_t PREF_SECTOR_WORDS = 128;         // ESPHome flash preference area (restore_from_flash)
+static const uint32_t TORQUE_PERIOD_US = 50;           // 20 kHz enable-pin pulsing, above hearing
+static const uint8_t TORQUE_MIN = 10;
 
-static uint32_t state_crc(const StoredState &st) {
+template<typename T> static uint32_t state_crc(const T &st) {
   // FNV-1a over everything except the crc field itself.
   const uint8_t *b = reinterpret_cast<const uint8_t *>(&st);
   uint32_t h = 2166136261UL;
-  for (size_t i = 0; i < offsetof(StoredState, crc); i++) {
+  for (size_t i = 0; i < offsetof(T, crc); i++) {
     h ^= b[i];
     h *= 16777619UL;
   }
   return h;
 }
 
-static bool state_ok(const StoredState &st) {
-  return st.magic == STATE_MAGIC && st.version == STATE_VERSION && st.crc == state_crc(st);
+template<typename T> static bool state_ok(const T &st, uint8_t version) {
+  return st.magic == STATE_MAGIC && st.version == version && st.crc == state_crc(st);
+}
+
+static StoredState upgrade_v1(const StoredStateV1 &o) {
+  StoredState n{};
+  n.magic = STATE_MAGIC;
+  n.version = STATE_VERSION;
+  n.flags = o.flags;
+  n.group = o.group;
+  n.order = o.order;
+  n.seq = o.seq;
+  n.position = o.position;
+  n.open_steps = o.open_steps;
+  n.closed_steps = o.closed_steps;
+  n.speed = o.speed;
+  n.nudge = o.nudge;
+  memcpy(n.label, o.label, NAME_LEN);
+  n.torque = 100;
+  n.crc = state_crc(n);
+  return n;
 }
 
 using cover::COVER_OPERATION_CLOSING;
@@ -150,6 +175,7 @@ void DaisyBlind::dump_config() {
   LOG_PIN("  Dir pin: ", dir_pin_);
   LOG_PIN("  Sleep/enable pin: ", sleep_pin_);
   ESP_LOGCONFIG(TAG, "  Coordination UDP port: %u", port_);
+  ESP_LOGCONFIG(TAG, "  Torque limit: %u%%", torque_limit_);
   ESP_LOGCONFIG(TAG, "  Position: %d steps (open=%d closed=%d)", (int) position_, (int) open_steps_,
                 (int) closed_steps_);
 }
@@ -289,7 +315,7 @@ bool DaisyBlind::load_state_() {
 
   StoredState st{};
   bool in_slot = false;
-  if (state_pref_.load(&st) && state_ok(st)) {
+  if (state_pref_.load(&st) && state_ok(st, STATE_VERSION)) {
     best = st;
     found = true;
     in_slot = true;
@@ -298,22 +324,41 @@ bool DaisyBlind::load_state_() {
 #ifdef USE_ESP8266
   // Scan the raw preference sector so the record is found even if the order of
   // other settings changed between firmware versions. Newest sequence wins.
+  // A version 1 record is used only if no version 2 record exists.
   static uint32_t raw[PREF_SECTOR_WORDS];
   const uint32_t addr = (uint32_t) &_SPIFFS_end - 0x40200000UL;
+  StoredStateV1 best_v1{};
+  bool found_v1 = false;
   if (spi_flash_read(addr, raw, sizeof(raw)) == SPI_FLASH_RESULT_OK) {
-    for (uint32_t off = 0; off + STATE_WORDS < PREF_SECTOR_WORDS; off++) {
-      StoredState cand{};
-      if (!rtc_pref_decode(raw + off, STATE_KEY, STATE_WORDS, reinterpret_cast<uint8_t *>(&cand), sizeof(cand)))
-        continue;
-      if (!state_ok(cand))
-        continue;
-      if (!found || (int32_t) (cand.seq - best.seq) > 0) {
-        ESP_LOGI(TAG, "Found state record at word %u (seq %u)", (unsigned) off, (unsigned) cand.seq);
-        best = cand;
-        found = true;
-        in_slot = false;
+    for (uint32_t off = 0; off < PREF_SECTOR_WORDS; off++) {
+      if (off + STATE_WORDS < PREF_SECTOR_WORDS) {
+        StoredState cand{};
+        if (rtc_pref_decode(raw + off, STATE_KEY, STATE_WORDS, reinterpret_cast<uint8_t *>(&cand), sizeof(cand)) &&
+            state_ok(cand, STATE_VERSION) && (!found || (int32_t) (cand.seq - best.seq) > 0)) {
+          ESP_LOGI(TAG, "Found state record at word %u (seq %u)", (unsigned) off, (unsigned) cand.seq);
+          best = cand;
+          found = true;
+          in_slot = false;
+        }
+      }
+      if (off + STATE_WORDS_V1 < PREF_SECTOR_WORDS) {
+        StoredStateV1 cand{};
+        if (rtc_pref_decode(raw + off, STATE_KEY_V1, STATE_WORDS_V1, reinterpret_cast<uint8_t *>(&cand),
+                            sizeof(cand)) &&
+            state_ok(cand, STATE_VERSION_V1) && (!found_v1 || (int32_t) (cand.seq - best_v1.seq) > 0)) {
+          best_v1 = cand;
+          found_v1 = true;
+        }
       }
     }
+  }
+  // Use a version 1 record when there is no version 2 record, or when it is
+  // newer (the blind was rolled back to older firmware and changed since).
+  if (found_v1 && (!found || (int32_t) (best_v1.seq - best.seq) > 0)) {
+    ESP_LOGI(TAG, "Upgrading version 1 state record (seq %u)", (unsigned) best_v1.seq);
+    best = upgrade_v1(best_v1);
+    found = true;
+    in_slot = false;
   }
 #endif
 
@@ -335,6 +380,7 @@ bool DaisyBlind::load_state_() {
   one_at_a_time_ = (best.flags & STATE_FLAG_ONE_AT_A_TIME) != 0;
   best.label[NAME_LEN - 1] = 0;
   label_ = best.label;
+  torque_limit_ = best.torque < TORQUE_MIN ? TORQUE_MIN : (best.torque > 100 ? 100 : best.torque);
   dir_dirty_ = true;
   loaded_ = true;
   if (in_slot) {
@@ -369,6 +415,7 @@ void DaisyBlind::save_state_(bool flush) {
   st.speed = (uint16_t) speed_sps_;
   st.nudge = (uint16_t) nudge_size_;
   snprintf(st.label, NAME_LEN, "%s", label_.c_str());
+  st.torque = torque_limit_;
   // Skip the write if nothing changed (e.g. entities re-published at boot).
   const uint32_t content = state_crc(st);
   if (content == last_content_ && have_saved_) {
@@ -433,12 +480,48 @@ void DaisyBlind::on_safe_shutdown() {
 
 // ---------------------------------------------------------------- motor
 
+void DaisyBlind::apply_enable_pin_(bool awake) {
+  if (sleep_pin_ == nullptr)
+    return;
+#ifdef USE_ESP8266
+  const uint8_t pin = sleep_pin_->get_pin();
+  if (awake && torque_limit_ < 100) {
+    // Pulse the driver's enable input so the coils are powered only part of
+    // the time: less average current, less torque. 20 kHz is above hearing and
+    // far faster than the coil current can follow, so the motor sees a steady
+    // reduced current rather than pulses.
+    const uint32_t on_us = (TORQUE_PERIOD_US * torque_limit_ + 50) / 100;
+    const uint32_t off_us = TORQUE_PERIOD_US - on_us;
+    const bool active_high = !sleep_pin_->is_inverted();
+    if (active_high) {
+      startWaveform(pin, on_us, off_us, 0);
+    } else {
+      startWaveform(pin, off_us, on_us, 0);  // high = disabled for an active-low ENABLE
+    }
+    return;
+  }
+  stopWaveform(pin);
+#endif
+  sleep_pin_->digital_write(awake);
+}
+
+void DaisyBlind::set_torque_limit(int32_t pct) {
+  const uint8_t v = (uint8_t) (pct < TORQUE_MIN ? TORQUE_MIN : (pct > 100 ? 100 : pct));
+  if (v == torque_limit_)
+    return;
+  torque_limit_ = v;
+  if (sleep_pin_ == nullptr && v < 100)
+    ESP_LOGW(TAG, "Torque limit needs sleep_pin (the A4988 ENABLE pin); it has no effect");
+  if (driver_awake_)
+    apply_enable_pin_(true);
+  settings_changed_();
+}
+
 void DaisyBlind::set_driver_awake_(bool awake, uint32_t now) {
   if (awake == driver_awake_)
     return;
   driver_awake_ = awake;
-  if (sleep_pin_ != nullptr)
-    sleep_pin_->digital_write(awake);
+  apply_enable_pin_(awake);
   if (awake) {
     wake_until_ = now + DRIVER_WAKE_MS;
     cur_sps_ = START_SPS;  // every burst of motion ramps up from rest

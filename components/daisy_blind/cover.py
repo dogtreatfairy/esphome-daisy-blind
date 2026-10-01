@@ -3,6 +3,7 @@ import esphome.config_validation as cv
 from esphome import pins
 from esphome.components import cover
 from esphome.const import CONF_ID, CONF_DIR_PIN, CONF_SLEEP_PIN, CONF_STEP_PIN, CONF_PORT
+from esphome.core import CORE
 
 DEPENDENCIES = ["network"]
 
@@ -15,7 +16,8 @@ CONFIG_SCHEMA = cv.All(
         {
             cv.Required(CONF_STEP_PIN): pins.gpio_output_pin_schema,
             cv.Required(CONF_DIR_PIN): pins.gpio_output_pin_schema,
-            cv.Optional(CONF_SLEEP_PIN): pins.gpio_output_pin_schema,
+            # Internal pin: the torque limit pulses it with the ESP8266 waveform generator.
+            cv.Optional(CONF_SLEEP_PIN): pins.internal_gpio_output_pin_schema,
             cv.Optional(CONF_PORT, default=44820): cv.port,
         }
     )
@@ -25,6 +27,13 @@ CONFIG_SCHEMA = cv.All(
 
 
 async def to_code(config):
+    if CORE.is_esp8266:
+        # Keep the real Arduino waveform generator in the build (ESPHome stubs it
+        # out unless a component asks for it).
+        from esphome.components.esp8266.const import require_waveform
+
+        require_waveform()
+
     var = cg.new_Pvariable(config[CONF_ID])
     await cover.register_cover(var, config)
     await cg.register_component(var, config)

@@ -42,6 +42,7 @@ esphome:
             id(blind).set_group_control(id(group_control).state);
             id(blind).set_hotspot_led(id(hotspot_led).state);
             id(blind).set_label(id(blind_label).state);
+            id(blind).set_torque_limit((int32_t) id(torque_limit).state);
             id(blind).finish_migration();
             return;
           }
@@ -54,6 +55,7 @@ esphome:
           set_num(id(sync_group), id(blind).get_group());
           set_num(id(firing_order), id(blind).get_order());
           set_num(id(nudge_size), id(blind).get_nudge_size());
+          set_num(id(torque_limit), id(blind).get_torque_limit());
           const size_t mode = id(blind).get_one_at_a_time() ? 1 : 0;
           if (id(coordination_mode).active_index().value_or(99) != mode) {
             auto c = id(coordination_mode).make_call(); c.set_index(mode); c.perform();
@@ -299,6 +301,28 @@ number:
     entity_category: config
     on_value:
       - lambda: id(blind).set_speed((int32_t) x);
+
+  # Lowers motor current by pulsing the A4988 ENABLE pin. Deliberately not
+  # restored by ESPHome: the value lives in the blind's own state record, so
+  # adding this entity doesn't shift any saved setting.
+  - platform: template
+    id: torque_limit
+    name: Torque limit
+    icon: mdi:arm-flex
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: false
+    initial_value: 100
+    min_value: 10
+    max_value: 100
+    step: 5
+    mode: box
+    entity_category: config
+    web_server:
+      sorting_group_id: sg_setup
+      sorting_weight: 4
+    on_value:
+      - lambda: id(blind).set_torque_limit((int32_t) x);
 
   - platform: template
     id: nudge_size

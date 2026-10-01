@@ -44,6 +44,26 @@ struct __attribute__((packed)) Packet {
 // It lives in ESPHome's preference sector, but at boot the whole sector is
 // scanned for it (by key, checksum, magic and CRC) so it survives any change
 // in the order other settings are allocated, and the newest copy wins.
+//
+// Version 1 (26.9.5 - 26.9.6). Kept only so it can be read and converted.
+struct __attribute__((packed)) StoredStateV1 {
+  uint32_t magic;
+  uint8_t version;
+  uint8_t flags;
+  uint8_t group;
+  uint8_t order;
+  uint32_t seq;
+  int32_t position;
+  int32_t open_steps;
+  int32_t closed_steps;
+  uint16_t speed;
+  uint16_t nudge;
+  char label[NAME_LEN];
+  uint32_t crc;
+};
+
+// Version 2: adds the torque limit and reserves room so future settings can
+// be added without changing the record's size again.
 struct __attribute__((packed)) StoredState {
   uint32_t magic;
   uint8_t version;
@@ -57,6 +77,8 @@ struct __attribute__((packed)) StoredState {
   uint16_t speed;
   uint16_t nudge;
   char label[NAME_LEN];
+  uint8_t torque;        // percent, 10..100
+  uint8_t reserved[11];  // zero; for future settings
   uint32_t crc;
 };
 
@@ -76,7 +98,7 @@ class DaisyBlind : public cover::Cover, public Component {
   // --- wiring (from YAML) ---
   void set_step_pin(GPIOPin *pin) { step_pin_ = pin; }
   void set_dir_pin(GPIOPin *pin) { dir_pin_ = pin; }
-  void set_sleep_pin(GPIOPin *pin) { sleep_pin_ = pin; }
+  void set_sleep_pin(InternalGPIOPin *pin) { sleep_pin_ = pin; }
   void set_port(uint16_t port) { port_ = port; }
 
   // --- runtime settings (from template entities) ---
@@ -98,6 +120,7 @@ class DaisyBlind : public cover::Cover, public Component {
   void set_hotspot_led(bool v) { hotspot_led_ = v; settings_changed_(); }
   void set_nudge_size(int32_t v) { nudge_size_ = v < 1 ? 1 : (v > 5000 ? 5000 : v); settings_changed_(); }
   void set_label(const std::string &label) { label_ = label; settings_changed_(); }
+  void set_torque_limit(int32_t pct);
 
   // --- stored values, for pushing into the entities at boot ---
   int32_t get_open_steps() const { return open_steps_; }
@@ -111,6 +134,7 @@ class DaisyBlind : public cover::Cover, public Component {
   bool get_hotspot_led() const { return hotspot_led_; }
   int32_t get_nudge_size() const { return nudge_size_; }
   const std::string &get_label() const { return label_; }
+  int32_t get_torque_limit() const { return torque_limit_; }
 
   // --- actions ---
   void stop();
@@ -143,6 +167,7 @@ class DaisyBlind : public cover::Cover, public Component {
   bool wants_move_() const { return target_ != position_; }
   void run_motor_(uint32_t now);
   void set_driver_awake_(bool awake, uint32_t now);
+  void apply_enable_pin_(bool awake);
   void begin_move_(int32_t target, uint32_t now);
   void apply_target_pct_(float pct);
   void finish_move_(uint32_t now);
@@ -176,7 +201,7 @@ class DaisyBlind : public cover::Cover, public Component {
 
   GPIOPin *step_pin_{nullptr};
   GPIOPin *dir_pin_{nullptr};
-  GPIOPin *sleep_pin_{nullptr};
+  InternalGPIOPin *sleep_pin_{nullptr};
   uint16_t port_{44820};
 
   // settings
@@ -190,6 +215,7 @@ class DaisyBlind : public cover::Cover, public Component {
   bool group_control_{false};
   bool hotspot_led_{true};
   int32_t nudge_size_{10};
+  uint8_t torque_limit_{100};
   std::string label_;
 
   // persistence

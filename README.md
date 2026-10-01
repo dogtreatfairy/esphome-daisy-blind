@@ -114,6 +114,7 @@ device and survives reboots and power loss.
 | **Open limit (steps)** | Step count that means fully open. Default 785. |
 | **Closed limit (steps)** | Step count that means fully closed. Default 0. |
 | **Motor speed (steps per second)** | Step rate. Default 250. |
+| **Torque limit** | Motor strength, 10 to 100%. Default 100. Lower it so a blind that reaches an end stop stalls instead of stripping its gears. See below. |
 | **Nudge size (steps)** | How far the two Nudge buttons move the blind. Default 10. |
 | **Mark as fully closed / open** | Tell the blind it is exactly at its closed or open limit right now. Use this to correct a blind that has lost track. |
 | **Hotspot LED** | Blink the on-board LED while the blind has no WiFi connection. Default on. |
@@ -158,6 +159,27 @@ it can hear, with its firing order, label, hostname and position. **Coordination
 shows this blind's place in the cycle and which mode is in effect. That is all pairing
 takes; there is no master to configure.
 
+### Setting the torque limit
+
+The 28BYJ-48's plastic gearbox can strip itself if the motor keeps pushing at an end stop.
+The torque limit reduces the motor's current by rapidly switching the A4988's ENABLE pin,
+so a weaker motor stalls harmlessly instead. Stalling doesn't damage a stepper. Lower
+current also means less heat. The only cost of going too low is that the blind may skip
+steps on a stiff part of its travel and lose track of where it is.
+
+Tune each blind on its own:
+
+1. Make sure the blind's position is correct, then set **Torque limit** to 80%.
+2. Run a full close and a full open. Watch that it reaches both ends cleanly and smoothly.
+3. Lower it by 10% and repeat, until a run stutters, buzzes in place, or stops short.
+4. If it lost track, nudge it back and press **Mark as fully closed**.
+5. Set the limit about 20% above the last level that worked, and run it a few more times.
+
+The effect depends on the motor, driver and supply, so the percentage isn't a precise force.
+It needs the ENABLE pin wired to `sleep_pin`, as in the standard wiring. Every move also
+starts and ends at 180 steps per second rather than crawling, because a stepper is strongest
+at low speed and the ends are where it meets the stops.
+
 ## Home Assistant
 
 Each blind appears as a `cover` with position, plus all the settings above as config
@@ -169,7 +191,7 @@ and command any one of them.
 
 The A4988 is a chopper driver, so a moving or holding motor draws roughly the current set
 by its Vref regardless of step rate. The coordination cuts the peak load to one motor at a
-time, and every burst of motion ramps up from 60 steps per second rather than starting at
+time, and every burst of motion ramps up from 180 steps per second rather than starting at
 full speed, which is where most skipped steps and the sharpest current spike come from.
 If a blind still skips steps, lower Vref on that driver or lower **Motor speed**.
 
